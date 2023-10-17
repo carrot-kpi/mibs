@@ -136,7 +136,9 @@ async fn scan_past<L: Listener + Send + Sync>(
         };
 
         for log in logs.into_iter() {
-            listener.on_event(&provider, &chain_config, log).await;
+            listener
+                .on_event(provider.clone(), &chain_config, log)
+                .await;
         }
 
         tracing::info!(
@@ -199,7 +201,9 @@ async fn scan_present<L: Listener + Send + Sync>(
         };
 
         while let Some(log) = stream.next().await {
-            listener.on_event(&provider, &chain_config, log).await;
+            listener
+                .on_event(provider.clone(), &chain_config, log)
+                .await;
         }
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use ethers::{
     providers::{Http, Provider as EthersProvider, ProviderError},
@@ -39,5 +41,5 @@ pub type Provider = EthersProvider<Http>;
 
 #[async_trait]
 pub trait Listener {
-    async fn on_event(&self, provider: &Provider, chain_config: &ChainConfig, log: Log);
+    async fn on_event(&self, provider: Arc<Provider>, chain_config: &ChainConfig, log: Log);
 }
