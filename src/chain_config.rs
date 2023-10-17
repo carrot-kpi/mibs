@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use ethers::types::Filter;
 
-use crate::{commons::{Listener, DEFAULT_PAST_EVENTS_QUERY_RANGE, DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS}, ScannerBuilder};
+use crate::commons::{
+    DEFAULT_PAST_EVENTS_QUERY_RANGE, DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS,
+};
 
 pub struct ChainConfig {
     pub id: u64,
@@ -14,9 +16,7 @@ pub struct ChainConfig {
     pub present_events_polling_interval: Duration,
 }
 
-pub struct ChainConfigBuilder<L: Listener + Send + Sync + 'static> {
-    scanner_builder: ScannerBuilder<L>,
-
+pub struct ChainConfigBuilder {
     id: u64,
     rpc_url: String,
     checkpoint_block: u64,
@@ -26,17 +26,9 @@ pub struct ChainConfigBuilder<L: Listener + Send + Sync + 'static> {
     present_events_polling_interval: Option<Duration>,
 }
 
-impl<L: Listener + Send + Sync + 'static> ChainConfigBuilder<L> {
-    pub fn new(
-        scanner_builder: ScannerBuilder<L>,
-        id: u64,
-        rpc_url: String,
-        checkpoint_block: u64,
-        events_filter: Filter,
-    ) -> Self {
+impl ChainConfigBuilder {
+    pub fn new(id: u64, rpc_url: String, checkpoint_block: u64, events_filter: Filter) -> Self {
         Self {
-            scanner_builder: scanner_builder,
-
             id,
             rpc_url,
             checkpoint_block,
@@ -47,8 +39,8 @@ impl<L: Listener + Send + Sync + 'static> ChainConfigBuilder<L> {
         }
     }
 
-    pub fn add(mut self) -> ScannerBuilder<L> {
-        self.scanner_builder.config.push(ChainConfig {
+    pub fn build(self) -> ChainConfig {
+        ChainConfig {
             id: self.id,
             rpc_url: self.rpc_url,
             checkpoint_block: self.checkpoint_block,
@@ -60,8 +52,7 @@ impl<L: Listener + Send + Sync + 'static> ChainConfigBuilder<L> {
             present_events_polling_interval: self.present_events_polling_interval.unwrap_or(
                 Duration::from_secs(DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS),
             ),
-        });
-        self.scanner_builder
+        }
     }
 
     pub fn past_events_query_range(mut self, past_events_query_range: u64) -> Self {

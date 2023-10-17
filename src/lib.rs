@@ -5,9 +5,8 @@ mod scanner;
 
 use std::sync::Arc;
 
-use chain_config::ChainConfigBuilder;
+use chain_config::ChainConfig;
 use commons::{Config, Error, Listener};
-use ethers::types::Filter;
 use thiserror::Error;
 use tokio::task::JoinSet;
 use tracing_subscriber::filter::LevelFilter;
@@ -93,13 +92,8 @@ impl<L: Listener + Send + Sync + 'static> ScannerBuilder<L> {
         }
     }
 
-    pub fn with_chain_config(
-        self,
-        id: u64,
-        rpc_url: String,
-        checkpoint_block: u64,
-        events_filter: Filter,
-    ) -> ChainConfigBuilder<L> {
-        ChainConfigBuilder::new(self, id, rpc_url, checkpoint_block, events_filter)
+    pub fn chain_config(mut self, config: ChainConfig) -> Self {
+        self.config.push(config);
+        self
     }
 }
