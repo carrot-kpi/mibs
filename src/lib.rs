@@ -9,8 +9,6 @@ use chain_config::ChainConfig;
 use commons::{Config, Error, Listener};
 use thiserror::Error;
 use tokio::task::JoinSet;
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 pub struct Scanner<L: Listener + Send> {
     config: Config,
@@ -26,20 +24,6 @@ impl<L: Listener + Send + Sync + 'static> Scanner<L> {
     }
 
     pub async fn scan(self) -> Result<(), Error> {
-        let subscriber = FmtSubscriber::builder()
-            .json()
-            .with_span_list(true)
-            .with_current_span(false)
-            .with_env_filter(
-                EnvFilter::builder()
-                    .with_default_directive(LevelFilter::INFO.into())
-                    .from_env()
-                    .map_err(|err| Error::LogLevel(err))?,
-            )
-            .with_ansi(true)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber).map_err(|err| Error::Tracing(err))?;
-
         let mut join_set = JoinSet::new();
         for chain_config in self.config.into_iter() {
             let rpc_endpoint = chain_config.rpc_url.as_str();
