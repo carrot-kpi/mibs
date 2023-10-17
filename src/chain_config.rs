@@ -66,13 +66,13 @@ impl ChainConfigBuilder {
         }
     }
 
-    pub fn past_events_query_range(mut self, past_events_query_range: u64) -> Self {
-        self.past_events_query_range = Some(past_events_query_range);
+    pub fn past_events_query_range(mut self, past_events_query_range: Option<u64>) -> Self {
+        self.past_events_query_range = past_events_query_range;
         self
     }
 
-    pub fn past_events_query_max_rps(mut self, past_events_query_max_rps: u32) -> Self {
-        self.past_events_query_max_rps = Some(past_events_query_max_rps);
+    pub fn past_events_query_max_rps(mut self, past_events_query_max_rps: Option<u32>) -> Self {
+        self.past_events_query_max_rps = past_events_query_max_rps;
         self
     }
 
