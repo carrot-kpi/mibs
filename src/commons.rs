@@ -1,9 +1,12 @@
 use async_trait::async_trait;
-use ethers::{providers::ProviderError, types::Log};
+use ethers::{
+    providers::{Http, Provider as EthersProvider, ProviderError},
+    types::Log,
+};
 use thiserror::Error;
 use tokio::task::JoinError;
 
-use crate::{chain_config::ChainConfig, provider::Provider};
+use crate::chain_config::ChainConfig;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -32,6 +35,7 @@ pub const DEFAULT_PAST_EVENTS_QUERY_RANGE: u64 = 5_000;
 pub const DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS: u64 = 60;
 
 pub type Config = Vec<ChainConfig>;
+pub type Provider = EthersProvider<Http>;
 
 #[async_trait]
 pub trait Listener {
