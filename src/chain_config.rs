@@ -16,6 +16,17 @@ pub struct ChainConfig {
     pub present_events_polling_interval: Duration,
 }
 
+impl ChainConfig {
+    pub fn builder(
+        id: u64,
+        rpc_url: String,
+        checkpoint_block: u64,
+        events_filter: Filter,
+    ) -> ChainConfigBuilder {
+        ChainConfigBuilder::new(id, rpc_url, checkpoint_block, events_filter)
+    }
+}
+
 pub struct ChainConfigBuilder {
     id: u64,
     rpc_url: String,
