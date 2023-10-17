@@ -3,7 +3,7 @@ use ethers::{providers::ProviderError, types::Log};
 use thiserror::Error;
 use tokio::task::JoinError;
 
-use crate::chain_config::ChainConfig;
+use crate::{chain_config::ChainConfig, provider::Provider};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -35,5 +35,5 @@ pub type Config = Vec<ChainConfig>;
 
 #[async_trait]
 pub trait Listener {
-    async fn on_event(&self, config: &ChainConfig, log: Log);
+    async fn on_event(&self, provider: &Provider, chain_config: &ChainConfig, log: Log);
 }
