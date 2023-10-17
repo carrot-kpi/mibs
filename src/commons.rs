@@ -2,17 +2,11 @@ use async_trait::async_trait;
 use ethers::{providers::ProviderError, types::Log};
 use thiserror::Error;
 use tokio::task::JoinError;
-use tracing::subscriber::SetGlobalDefaultError;
-use tracing_subscriber::filter::FromEnvError;
 
 use crate::chain_config::ChainConfig;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("could not determine log level from env")]
-    LogLevel(#[from] FromEnvError),
-    #[error("could not set global default tracing subscriber")]
-    Tracing(#[from] SetGlobalDefaultError),
     #[error("error joining past and present scanning tasks for chain {chain_id}")]
     PresentPastJoin { chain_id: u64, source: JoinError },
     #[error("error joining chain scanning tasks")]
