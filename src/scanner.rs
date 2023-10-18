@@ -2,11 +2,7 @@ use std::{num::NonZeroU32, sync::Arc};
 
 use ethers::{middleware::Middleware, providers::StreamExt};
 use governor::{Quota, RateLimiter};
-use tokio::{
-    sync::{oneshot, Mutex},
-    task::JoinSet,
-};
-use tracing::info_span;
+use tokio::task::JoinSet;
 use tracing_futures::Instrument;
 
 use crate::{
@@ -19,23 +15,12 @@ pub async fn scan<L: Listener + Send + Sync + Sync + 'static>(
     listener: Arc<L>,
     chain_config: Arc<ChainConfig>,
 ) -> Result<(), Error> {
-    // When the past scanner is running it has control over the checkpoint block number update.
-    // This control is passed over to the present scanner only when the past scanner is finished
-    // in order to avoid creating holes in the indexing history. In short: the checkpoint block number
-    // must always be the minimum block number possible between what the present and past scanners
-    // are currently analyzing in order to avoid outcomes resulting in a wrong history when the
-    // service is restarted.
-    // This dynamic is handled with a oneshot channel. When the past scanner has finished processing
-    // its share, it communicates it to the present scanner which can then take over the checkpoint
-    // block number updates.
-    let (tx, rx) = oneshot::channel();
-
     let chain_id = chain_config.id;
 
-    let present_scanner = scan_present(rx, listener.clone(), chain_config.clone())
+    let present_scanner = scan_present(listener.clone(), chain_config.clone())
         .instrument(tracing::info_span!("present-scanner", chain_id));
 
-    let past_scanner = scan_past(tx, listener.clone(), chain_config.clone())
+    let past_scanner = scan_past(listener.clone(), chain_config.clone())
         .instrument(tracing::info_span!("past-scanner", chain_id));
 
     let mut join_set = JoinSet::new();
@@ -63,7 +48,6 @@ pub async fn scan<L: Listener + Send + Sync + Sync + 'static>(
 }
 
 async fn scan_past<L: Listener + Send + Sync>(
-    checkpoint_ownership_update_sender: oneshot::Sender<bool>,
     listener: Arc<L>,
     chain_config: Arc<ChainConfig>,
 ) -> Result<(), Error> {
@@ -85,7 +69,9 @@ async fn scan_past<L: Listener + Send + Sync>(
 
     if full_range == 0 {
         tracing::info!("no past blocks to scan, skipping");
-        yield_checkpoint_updates_ownership(checkpoint_ownership_update_sender)?;
+        listener
+            .on_past_events_finished(provider.clone(), &chain_config)
+            .await;
         return Ok(());
     }
 
@@ -137,7 +123,7 @@ async fn scan_past<L: Listener + Send + Sync>(
 
         for log in logs.into_iter() {
             listener
-                .on_event(provider.clone(), &chain_config, log)
+                .on_past_event(provider.clone(), &chain_config, log)
                 .await;
         }
 
@@ -154,37 +140,19 @@ async fn scan_past<L: Listener + Send + Sync>(
         from_block = to_block + 1;
     }
 
-    yield_checkpoint_updates_ownership(checkpoint_ownership_update_sender)?;
+    listener
+        .on_past_events_finished(provider.clone(), &chain_config)
+        .await;
 
-    tracing::info!(
-        "finished scanning past blocks, checkpoint updates ownership transferred to present scanner"
-    );
+    tracing::info!("finished scanning past blocks");
 
     Ok(())
 }
 
-fn yield_checkpoint_updates_ownership(
-    checkpoint_ownership_update_sender: oneshot::Sender<bool>,
-) -> Result<(), Error> {
-    checkpoint_ownership_update_sender
-        .send(true)
-        .map_err(|_| Error::CheckpointUpdatesOwnershipTransfer)
-}
-
 async fn scan_present<L: Listener + Send + Sync>(
-    checkpoint_ownership_update_receiver: oneshot::Receiver<bool>,
     listener: Arc<L>,
     chain_config: Arc<ChainConfig>,
 ) -> Result<(), Error> {
-    let update_snapshot_block_number = Arc::new(Mutex::new(false));
-    tokio::spawn(
-        message_receiver(
-            checkpoint_ownership_update_receiver,
-            update_snapshot_block_number.clone(),
-        )
-        .instrument(info_span!("message-receiver")),
-    );
-
     let logs_polling_interval_seconds = chain_config.present_events_polling_interval;
 
     loop {
@@ -202,27 +170,8 @@ async fn scan_present<L: Listener + Send + Sync>(
 
         while let Some(log) = stream.next().await {
             listener
-                .on_event(provider.clone(), &chain_config, log)
+                .on_present_event(provider.clone(), &chain_config, log)
                 .await;
-        }
-    }
-}
-
-async fn message_receiver(
-    receiver: oneshot::Receiver<bool>,
-    update_snapshot_block_number: Arc<Mutex<bool>>,
-) {
-    match receiver.await {
-        Ok(value) => {
-            if !value {
-                panic!("snapshot updates ownership channel receiver received a false value: this should never happen");
-            } else {
-                *update_snapshot_block_number.lock().await = value;
-                tracing::info!("snapshot updates ownership taken");
-            }
-        }
-        Err(error) => {
-            tracing::error!("error while receiving control over snapshot block number update from past scanner\n\n{:#}", error);
         }
     }
 }

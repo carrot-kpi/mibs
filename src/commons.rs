@@ -16,10 +16,6 @@ pub enum Error {
     PresentPastJoin { chain_id: u64, source: JoinError },
     #[error("error joining chain scanning tasks")]
     ChainsJoin(#[from] JoinError),
-    #[error(
-        "error sending checkpoint updates ownership transfer message from past to present scanner"
-    )]
-    CheckpointUpdatesOwnershipTransfer,
     #[error("chain id mismatch, provider gave {from_provider} while {expected} was expected")]
     ProviderChainIdMismatch { from_provider: u64, expected: u64 },
     #[error("could not get provider for chain {chain_id}")]
@@ -41,5 +37,9 @@ pub type Provider = EthersProvider<Http>;
 
 #[async_trait]
 pub trait Listener {
-    async fn on_event(&self, provider: Arc<Provider>, chain_config: &ChainConfig, log: Log);
+    async fn on_past_event(&self, provider: Arc<Provider>, chain_config: &ChainConfig, log: Log);
+    
+    async fn on_past_events_finished(&self, provider: Arc<Provider>, chain_config: &ChainConfig);
+    
+    async fn on_present_event(&self, provider: Arc<Provider>, chain_config: &ChainConfig, log: Log);
 }
