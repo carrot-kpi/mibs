@@ -1,7 +1,7 @@
 [package]
 name = "mibs"
 description = "MIBS (MInimal Block Scanner) is a minimal EVM-compatible block scanner written in Rust."
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
