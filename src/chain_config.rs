@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use ethers::types::Filter;
 
-use crate::commons::{
-    DEFAULT_PAST_EVENTS_QUERY_RANGE, DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS,
-};
+const DEFAULT_PAST_EVENTS_QUERY_RANGE: u64 = 5_000;
+const DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS: u64 = 60;
 
 pub struct ChainConfig {
     pub id: u64,

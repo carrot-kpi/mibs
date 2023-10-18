@@ -1,175 +1,151 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::{fmt::Debug, pin::Pin, time::Duration};
 
-use ethers::{middleware::Middleware, providers::StreamExt};
-use governor::{Quota, RateLimiter};
-use tokio::task::JoinSet;
-use tracing_futures::Instrument;
-
-use crate::{
-    chain_config::ChainConfig,
-    commons::{Error, Listener},
-    provider::get_provider,
+use ethers::types::{Filter, Log, U256};
+use jsonrpsee::{
+    core::{client::ClientT, params::BatchRequestBuilder},
+    http_client::{HttpClient, HttpClientBuilder},
 };
+use serde_json::Value;
+use thiserror::Error;
 
-pub async fn scan<L: Listener + Send + Sync + Sync + 'static>(
-    listener: Arc<L>,
-    chain_config: Arc<ChainConfig>,
-) -> Result<(), Error> {
-    let chain_id = chain_config.id;
+use crate::types::Update;
 
-    let present_scanner = scan_present(listener.clone(), chain_config.clone())
-        .instrument(tracing::info_span!("present-scanner", chain_id));
+#[derive(Error, Debug)]
+pub enum ScannerError {
+    #[error("could not connect to rpc url {rpc_url}")]
+    Connection {
+        rpc_url: String,
+        source: jsonrpsee::core::Error,
+    },
+    #[error("could not create new logs filter to stream changes")]
+    NewFilter(jsonrpsee::core::Error),
+    #[error("could not batch rpc call with method {method}")]
+    AddCallToBatch {
+        method: String,
+        source: jsonrpsee::core::Error,
+    },
+    #[error("could get new logs filter update")]
+    FilterUpdate(jsonrpsee::core::Error),
+    #[error("inconsistent number of rpc responses")]
+    InconsistentResponses,
+    #[error("some or all responses errored out")]
+    Responses,
+    #[error("error deserializing response")]
+    Deserialize(serde_json::error::Error),
+}
 
-    let past_scanner = scan_past(listener.clone(), chain_config.clone())
-        .instrument(tracing::info_span!("past-scanner", chain_id));
+pub struct Scanner {
+    client: HttpClient,
+    interval: Duration,
+    filter: Filter,
+}
 
-    let mut join_set = JoinSet::new();
-    join_set.spawn(present_scanner);
-    join_set.spawn(past_scanner);
-
-    // wait forever unless some task stops with an error
-    while let Some(join_result) = join_set.join_next().await {
-        match join_result {
-            Ok(result) => {
-                if let Err(error) = result {
-                    return Err(error);
-                }
-            }
-            Err(err) => {
-                return Err(Error::PresentPastJoin {
-                    chain_id,
+impl Scanner {
+    pub fn new(rpc_url: String, interval: Duration, filter: Filter) -> Result<Self, ScannerError> {
+        Ok(Self {
+            client: HttpClientBuilder::new()
+                .build(rpc_url.clone())
+                .map_err(|err| ScannerError::Connection {
+                    rpc_url,
                     source: err,
-                });
-            }
-        }
+                })?,
+            interval,
+            filter,
+        })
     }
 
-    Ok(())
-}
+    pub async fn stream(
+        self,
+    ) -> Result<
+        Pin<Box<impl futures::Stream<Item = Result<Vec<Update>, ScannerError>>>>,
+        ScannerError,
+    > {
+        let filter_id = self
+            .client
+            .request::<U256, Vec<Filter>>("eth_newFilter", vec![self.filter])
+            .await
+            .map_err(|err| ScannerError::NewFilter(err))?;
 
-async fn scan_past<L: Listener + Send + Sync>(
-    listener: Arc<L>,
-    chain_config: Arc<ChainConfig>,
-) -> Result<(), Error> {
-    let chain_id = chain_config.id;
-    let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
-    let block_number = provider
-        .get_block_number()
-        .await
-        .map_err(|err| Error::BlockNumber {
-            chain_id,
-            source: err,
-        })?
-        .as_u64();
+        let interval = self.interval.clone();
+        let stream = futures::stream::unfold(Vec::<Update>::new(), move |_| {
+            let mut interval = tokio::time::interval(interval);
+            let filter_id = filter_id.clone();
+            let client = self.client.clone();
 
-    let initial_block = chain_config.checkpoint_block;
-    let mut from_block = initial_block;
-    let full_range = block_number - initial_block;
-    let chunk_size = chain_config.past_events_query_range;
+            async move {
+                interval.tick().await;
 
-    if full_range == 0 {
-        tracing::info!("no past blocks to scan, skipping");
-        listener
-            .on_past_events_finished(provider.clone(), &chain_config)
-            .await;
-        return Ok(());
-    }
+                const ETH_GET_BLOCK_NUMBER_METHOD: &str = "eth_blockNumber";
+                const ETH_GET_FILTER_CHANGES_METHOD: &str = "eth_getFilterChanges";
 
-    tracing::info!(
-        "pinning from {} past blocks, analyzing {} blocks at a time",
-        block_number - from_block,
-        chunk_size
-    );
+                let mut batched_requests_builder = BatchRequestBuilder::new();
 
-    let rate_limiter =
-        if let Some(past_events_query_max_rps) = chain_config.past_events_query_max_rps {
-            Some(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(past_events_query_max_rps).unwrap(),
-            )))
-        } else {
-            None
-        };
+                match batched_requests_builder
+                    .insert(ETH_GET_BLOCK_NUMBER_METHOD, Vec::<String>::new())
+                {
+                    Err(err) => {
+                        return Some((
+                            Err(ScannerError::AddCallToBatch {
+                                method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
+                                source: err,
+                            }),
+                            vec![],
+                        ))
+                    }
+                    Ok(_) => {}
+                }
 
-    loop {
-        let to_block = if from_block + chunk_size > block_number {
-            block_number
-        } else {
-            from_block + chunk_size
-        };
+                match batched_requests_builder
+                    .insert(ETH_GET_FILTER_CHANGES_METHOD, vec![filter_id])
+                {
+                    Err(err) => {
+                        return Some((
+                            Err(ScannerError::AddCallToBatch {
+                                method: ETH_GET_FILTER_CHANGES_METHOD.to_owned(),
+                                source: err,
+                            }),
+                            vec![],
+                        ))
+                    }
+                    Ok(_) => {}
+                };
 
-        let filter = chain_config
-            .events_filter
-            .clone()
-            .from_block(from_block)
-            .to_block(to_block);
+                let responses = match client
+                    .batch_request::<Value>(batched_requests_builder)
+                    .await
+                {
+                    Err(err) => return Some((Err(ScannerError::FilterUpdate(err)), vec![])),
+                    Ok(res) => res,
+                };
+                if responses.len() != 2 {
+                    return Some((Err(ScannerError::InconsistentResponses), vec![]));
+                }
 
-        // apply rate limiting if necessary
-        if let Some(rate_limiter) = &rate_limiter {
-            rate_limiter.until_ready().await;
-        }
+                let mut responses = match responses.into_ok() {
+                    Err(_) => return Some((Err(ScannerError::Responses), vec![])),
+                    Ok(res) => res,
+                };
 
-        let logs = match provider.get_logs(&filter).await {
-            Ok(logs) => logs,
-            Err(error) => {
-                tracing::error!(
-                    "error fetching logs from block {} to {}: {:#}",
-                    from_block,
-                    to_block,
-                    error
-                );
-                continue;
+                let block_number = match serde_json::from_value::<U256>(responses.nth(0).unwrap()) {
+                    Err(err) => return Some((Err(ScannerError::Deserialize(err)), vec![])),
+                    Ok(res) => res,
+                };
+
+                let logs = match serde_json::from_value::<Vec<Log>>(responses.nth(0).unwrap()) {
+                    Err(err) => return Some((Err(ScannerError::Deserialize(err)), vec![])),
+                    Ok(res) => res,
+                };
+
+                let mut updates = logs
+                    .into_iter()
+                    .map(|log| Update::NewLog(log))
+                    .collect::<Vec<Update>>();
+                updates.push(Update::NewBlock(block_number.as_u64()));
+
+                Some((Ok(updates), vec![]))
             }
-        };
+        });
 
-        listener
-            .on_past_events(provider.clone(), &chain_config, from_block, to_block, logs)
-            .await;
-
-        tracing::info!(
-            "{} -> {} - scanned {}% of past blocks",
-            from_block,
-            to_block,
-            ((to_block as f32 - initial_block as f32) / full_range as f32) * 100f32
-        );
-
-        if to_block == block_number {
-            break;
-        }
-        from_block = to_block + 1;
-    }
-
-    listener
-        .on_past_events_finished(provider.clone(), &chain_config)
-        .await;
-
-    tracing::info!("finished scanning past blocks");
-
-    Ok(())
-}
-
-async fn scan_present<L: Listener + Send + Sync>(
-    listener: Arc<L>,
-    chain_config: Arc<ChainConfig>,
-) -> Result<(), Error> {
-    let logs_polling_interval_seconds = chain_config.present_events_polling_interval;
-
-    loop {
-        tracing::info!("watching present logs");
-
-        let chain_id = chain_config.id;
-        let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
-        let mut stream = match provider.watch(&chain_config.events_filter).await {
-            Ok(watcher) => watcher.interval(logs_polling_interval_seconds).stream(),
-            Err(error) => {
-                tracing::error!("could not get events filter watcher: {:#}", error);
-                continue;
-            }
-        };
-
-        while let Some(log) = stream.next().await {
-            listener
-                .on_present_event(provider.clone(), &chain_config, log)
-                .await;
-        }
+        Ok(Box::pin(stream))
     }
 }

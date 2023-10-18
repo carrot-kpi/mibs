@@ -1,26 +1,54 @@
 pub mod chain_config;
-pub mod commons;
-mod provider;
 mod scanner;
+pub mod types;
+mod utils;
 
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use chain_config::ChainConfig;
-use commons::{Config, Error, Listener};
+use ethers::providers::{Middleware, ProviderError};
+use futures::StreamExt;
+use governor::{Quota, RateLimiter};
 use thiserror::Error;
-use tokio::task::JoinSet;
+use tokio::{
+    sync::Mutex,
+    task::{JoinError, JoinSet},
+};
+use tracing_futures::Instrument;
+use types::{Config, Listener};
 
-pub struct Scanner<L: Listener + Send> {
-    config: Config,
-    listener: Arc<L>,
+use crate::{scanner::Scanner, types::Update, utils::get_provider};
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("error joining past and present scanning tasks for chain {chain_id}")]
+    PresentPastJoin { chain_id: u64, source: JoinError },
+    #[error("error joining chain scanning tasks")]
+    ChainsJoin(#[from] JoinError),
+    #[error("chain id mismatch, provider gave {from_provider} while {expected} was expected")]
+    ProviderChainIdMismatch { from_provider: u64, expected: u64 },
+    #[error("could not get provider for chain {chain_id}")]
+    ProviderConnection { chain_id: u64 },
+    #[error("could not get chain id from provider for chain {chain_id}")]
+    ProviderChainId { chain_id: u64 },
+    #[error("could not get current block number for chain {chain_id}")]
+    BlockNumber {
+        chain_id: u64,
+        source: ProviderError,
+    },
 }
 
-impl<L: Listener + Send + Sync + 'static> Scanner<L> {
-    pub fn builder(listener: L) -> ScannerBuilder<L>
+pub struct Mibs<L: Listener + Send> {
+    config: Config,
+    listener: Arc<Mutex<L>>,
+}
+
+impl<L: Listener + Send + Sync + 'static> Mibs<L> {
+    pub fn builder(listener: L) -> MibsBuilder<L>
     where
         L: Listener,
     {
-        ScannerBuilder::new(listener)
+        MibsBuilder::new(listener)
     }
 
     pub async fn scan(self) -> Result<(), Error> {
@@ -35,7 +63,10 @@ impl<L: Listener + Send + Sync + 'static> Scanner<L> {
                 rpc_endpoint
             );
 
-            join_set.spawn(scanner::scan(self.listener.clone(), Arc::new(chain_config)));
+            join_set.spawn(Self::scan_chain(
+                self.listener.clone(),
+                Arc::new(chain_config),
+            ));
         }
 
         // wait forever unless some task stops with an error
@@ -54,14 +85,215 @@ impl<L: Listener + Send + Sync + 'static> Scanner<L> {
 
         Ok(())
     }
+
+    async fn scan_chain(
+        listener: Arc<Mutex<L>>,
+        chain_config: Arc<ChainConfig>,
+    ) -> Result<(), Error> {
+        let chain_id = chain_config.id;
+
+        let present_scanner = Self::scan_present(listener.clone(), chain_config.clone())
+            .instrument(tracing::info_span!("present-scanner", chain_id));
+
+        let past_scanner = Self::scan_past(listener.clone(), chain_config.clone())
+            .instrument(tracing::info_span!("past-scanner", chain_id));
+
+        let mut join_set = JoinSet::new();
+        join_set.spawn(present_scanner);
+        join_set.spawn(past_scanner);
+
+        // wait forever unless some task stops with an error
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok(result) => {
+                    if let Err(error) = result {
+                        return Err(error);
+                    }
+                }
+                Err(err) => {
+                    return Err(Error::PresentPastJoin {
+                        chain_id,
+                        source: err,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn scan_past(
+        listener: Arc<Mutex<L>>,
+        chain_config: Arc<ChainConfig>,
+    ) -> Result<(), Error> {
+        let chain_id = chain_config.id;
+        let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
+        let block_number = provider
+            .get_block_number()
+            .await
+            .map_err(|err| Error::BlockNumber {
+                chain_id,
+                source: err,
+            })?
+            .as_u64();
+
+        let initial_block = chain_config.checkpoint_block;
+        let mut from_block = initial_block;
+        let full_range = block_number - initial_block;
+        let chunk_size = chain_config.past_events_query_range;
+
+        if full_range == 0 {
+            tracing::info!("no past blocks to scan, skipping");
+            listener
+                .lock()
+                .await
+                .on_update(
+                    provider.clone(),
+                    &chain_config,
+                    Update::PastBatchCompleted {
+                        from_block,
+                        to_block: from_block,
+                        progress_percentage: 100f32,
+                    },
+                )
+                .await;
+            return Ok(());
+        }
+
+        tracing::info!(
+            "pinning from {} past blocks, analyzing {} blocks at a time",
+            block_number - from_block,
+            chunk_size
+        );
+
+        let rate_limiter =
+            if let Some(past_events_query_max_rps) = chain_config.past_events_query_max_rps {
+                Some(RateLimiter::direct(Quota::per_second(
+                    NonZeroU32::new(past_events_query_max_rps).unwrap(),
+                )))
+            } else {
+                None
+            };
+
+        loop {
+            let to_block = if from_block + chunk_size > block_number {
+                block_number
+            } else {
+                from_block + chunk_size
+            };
+
+            let filter = chain_config
+                .events_filter
+                .clone()
+                .from_block(from_block)
+                .to_block(to_block);
+
+            // apply rate limiting if necessary
+            if let Some(rate_limiter) = &rate_limiter {
+                rate_limiter.until_ready().await;
+            }
+
+            let logs = match provider.get_logs(&filter).await {
+                Ok(logs) => logs,
+                Err(error) => {
+                    tracing::error!(
+                        "error fetching logs from block {} to {}: {:#}",
+                        from_block,
+                        to_block,
+                        error
+                    );
+                    continue;
+                }
+            };
+
+            for log in logs.into_iter() {
+                listener
+                    .lock()
+                    .await
+                    .on_update(provider.clone(), &chain_config, Update::NewLog(log))
+                    .await;
+            }
+
+            listener
+                .lock()
+                .await
+                .on_update(
+                    provider.clone(),
+                    &chain_config,
+                    Update::PastBatchCompleted {
+                        from_block,
+                        to_block,
+                        progress_percentage: ((to_block as f32 - initial_block as f32)
+                            / full_range as f32)
+                            * 100f32,
+                    },
+                )
+                .await;
+
+            if to_block == block_number {
+                break;
+            }
+            from_block = to_block + 1;
+        }
+
+        Ok(())
+    }
+
+    async fn scan_present(
+        listener: Arc<Mutex<L>>,
+        chain_config: Arc<ChainConfig>,
+    ) -> Result<(), Error> {
+        loop {
+            tracing::info!("watching present logs");
+
+            let chain_id = chain_config.id;
+            let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
+            let stream_future = match Scanner::new(
+                chain_config.rpc_url.clone(),
+                chain_config.present_events_polling_interval,
+                chain_config.events_filter.clone(),
+            ) {
+                Ok(scanner) => scanner.stream(),
+                Err(error) => {
+                    tracing::error!("could not get onchain scanner: {:#}", error);
+                    continue;
+                }
+            };
+
+            let mut stream = match stream_future.await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::error!("could not get onchain scanner stream: {:#}", error);
+                    continue;
+                }
+            };
+
+            while let Some(updates_result) = stream.next().await {
+                match updates_result {
+                    Ok(logs) => {
+                        for log in logs.into_iter() {
+                            listener
+                                .lock()
+                                .await
+                                .on_update(provider.clone(), &chain_config, log)
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("error while scanning: {:#}", err);
+                    }
+                }
+            }
+        }
+    }
 }
 
-pub struct ScannerBuilder<L: Listener + Send + Sync + 'static> {
+pub struct MibsBuilder<L: Listener + Send + Sync + 'static> {
     config: Config,
     listener: L,
 }
 
-impl<L: Listener + Send + Sync + 'static> ScannerBuilder<L> {
+impl<L: Listener + Send + Sync + 'static> MibsBuilder<L> {
     pub fn new(listener: L) -> Self {
         Self {
             config: vec![],
@@ -69,10 +301,10 @@ impl<L: Listener + Send + Sync + 'static> ScannerBuilder<L> {
         }
     }
 
-    pub fn build(self) -> Scanner<L> {
-        Scanner {
+    pub fn build(self) -> Mibs<L> {
+        Mibs {
             config: self.config,
-            listener: Arc::new(self.listener),
+            listener: Arc::new(Mutex::new(self.listener)),
         }
     }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ethers::providers::{Http, Middleware, Provider as EthersProvider};
 
-use crate::{Error, commons::Provider};
+use crate::{types::Provider, Error};
 
 pub async fn get_provider(url: String, expected_chain_id: u64) -> Result<Arc<Provider>, Error> {
     let provider =
