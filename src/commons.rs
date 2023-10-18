@@ -37,13 +37,13 @@ pub type Provider = EthersProvider<Http>;
 
 #[async_trait]
 pub trait Listener {
-    async fn on_past_event(
+    async fn on_past_events(
         &self,
         provider: Arc<Provider>,
         chain_config: &ChainConfig,
         range_from_block: u64,
         range_to_block: u64,
-        log: Log,
+        logs: Vec<Log>,
     );
 
     async fn on_past_events_finished(&self, provider: Arc<Provider>, chain_config: &ChainConfig);

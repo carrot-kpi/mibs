@@ -121,11 +121,9 @@ async fn scan_past<L: Listener + Send + Sync>(
             }
         };
 
-        for log in logs.into_iter() {
-            listener
-                .on_past_event(provider.clone(), &chain_config, from_block, to_block, log)
-                .await;
-        }
+        listener
+            .on_past_events(provider.clone(), &chain_config, from_block, to_block, logs)
+            .await;
 
         tracing::info!(
             "{} -> {} - scanned {}% of past blocks",
