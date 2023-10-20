@@ -10,6 +10,7 @@ pub struct ChainConfig {
     pub rpc_url: String,
     pub checkpoint_block: u64,
     pub events_filter: Filter,
+    pub skip_past: bool,
     pub past_events_query_range: u64,
     pub past_events_query_max_rps: Option<u32>,
     pub present_events_polling_interval: Duration,
@@ -31,6 +32,7 @@ pub struct ChainConfigBuilder {
     rpc_url: String,
     checkpoint_block: u64,
     events_filter: Filter,
+    skip_past: Option<bool>,
     past_events_query_range: Option<u64>,
     past_events_query_max_rps: Option<u32>,
     present_events_polling_interval: Option<Duration>,
@@ -43,6 +45,7 @@ impl ChainConfigBuilder {
             rpc_url,
             checkpoint_block,
             events_filter,
+            skip_past: None,
             past_events_query_range: None,
             past_events_query_max_rps: None,
             present_events_polling_interval: None,
@@ -55,6 +58,7 @@ impl ChainConfigBuilder {
             rpc_url: self.rpc_url,
             checkpoint_block: self.checkpoint_block,
             events_filter: self.events_filter,
+            skip_past: self.skip_past.unwrap_or(false),
             past_events_query_range: self
                 .past_events_query_range
                 .unwrap_or(DEFAULT_PAST_EVENTS_QUERY_RANGE),
@@ -63,6 +67,11 @@ impl ChainConfigBuilder {
                 Duration::from_secs(DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS),
             ),
         }
+    }
+
+    pub fn skip_past(mut self, skip_past: Option<bool>) -> Self {
+        self.skip_past = skip_past;
+        self
     }
 
     pub fn past_events_query_range(mut self, past_events_query_range: Option<u64>) -> Self {
