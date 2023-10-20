@@ -4,6 +4,7 @@ use ethers::types::{Filter, Log, U256};
 use jsonrpsee::{
     core::{client::ClientT, params::BatchRequestBuilder},
     http_client::{HttpClient, HttpClientBuilder},
+    types::ErrorObject,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -12,26 +13,31 @@ use crate::types::Update;
 
 #[derive(Error, Debug)]
 pub enum ScannerError {
-    #[error("could not connect to rpc url {rpc_url}")]
+    #[error("could not connect to rpc url {rpc_url}: {source:#}")]
     Connection {
         rpc_url: String,
         source: jsonrpsee::core::Error,
     },
-    #[error("could not create new logs filter to stream changes")]
-    NewFilter(jsonrpsee::core::Error),
-    #[error("could not batch rpc call with method {method}")]
+    #[error("could not create new logs filter to stream changes: {0:#}")]
+    NewFilter(#[source] jsonrpsee::core::Error),
+    #[error("could not batch rpc call with method {method}: {source:#}")]
     AddCallToBatch {
         method: String,
+        #[source]
         source: jsonrpsee::core::Error,
     },
-    #[error("could get new logs filter update")]
-    FilterUpdate(jsonrpsee::core::Error),
+    #[error("could get new logs filter update: {0:#}")]
+    FilterUpdate(#[source] jsonrpsee::core::Error),
     #[error("inconsistent number of rpc responses")]
     InconsistentResponses,
-    #[error("some or all responses errored out")]
-    Responses,
-    #[error("error deserializing response")]
-    Deserialize(serde_json::error::Error),
+    #[error("{method} call failed: ({}: {})", .source.code(), .source.message())]
+    Response {
+        method: String,
+        #[source]
+        source: ErrorObject<'static>,
+    },
+    #[error("error deserializing response: {0:#}")]
+    Deserialize(#[source] serde_json::error::Error),
 }
 
 pub struct Scanner {
@@ -121,17 +127,40 @@ impl Scanner {
                     return Some((Err(ScannerError::InconsistentResponses), vec![]));
                 }
 
-                let mut responses = match responses.into_ok() {
-                    Err(_) => return Some((Err(ScannerError::Responses), vec![])),
+                let mut responses = responses.into_iter();
+
+                let next_response = match responses.next().unwrap() {
                     Ok(res) => res,
+                    Err(err) => {
+                        return Some((
+                            Err(ScannerError::Response {
+                                method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
+                                source: err.into_owned(),
+                            }),
+                            vec![],
+                        ))
+                    }
                 };
 
-                let block_number = match serde_json::from_value::<U256>(responses.nth(0).unwrap()) {
+                let block_number = match serde_json::from_value::<U256>(next_response) {
                     Err(err) => return Some((Err(ScannerError::Deserialize(err)), vec![])),
                     Ok(res) => res,
                 };
 
-                let logs = match serde_json::from_value::<Vec<Log>>(responses.nth(0).unwrap()) {
+                let next_response = match responses.next().unwrap() {
+                    Ok(res) => res,
+                    Err(err) => {
+                        return Some((
+                            Err(ScannerError::Response {
+                                method: ETH_GET_FILTER_CHANGES_METHOD.to_owned(),
+                                source: err.into_owned(),
+                            }),
+                            vec![],
+                        ))
+                    }
+                };
+
+                let logs = match serde_json::from_value::<Vec<Log>>(next_response) {
                     Err(err) => return Some((Err(ScannerError::Deserialize(err)), vec![])),
                     Ok(res) => res,
                 };
