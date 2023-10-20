@@ -1,6 +1,8 @@
 use std::{fmt::Debug, pin::Pin, time::Duration};
 
-use ethers::types::{Filter, Log, U256};
+use async_stream::try_stream;
+use ethers::types::{BlockNumber, Filter, Log, U64};
+use futures::Stream;
 use jsonrpsee::{
     core::{client::ClientT, params::BatchRequestBuilder},
     http_client::{HttpClient, HttpClientBuilder},
@@ -8,6 +10,7 @@ use jsonrpsee::{
 };
 use serde_json::Value;
 use thiserror::Error;
+use tokio::time::Interval;
 
 use crate::types::Update;
 
@@ -18,8 +21,6 @@ pub enum ScannerError {
         rpc_url: String,
         source: jsonrpsee::core::Error,
     },
-    #[error("could not create new logs filter to stream changes: {0:#}")]
-    NewFilter(#[source] jsonrpsee::core::Error),
     #[error("could not batch rpc call with method {method}: {source:#}")]
     AddCallToBatch {
         method: String,
@@ -42,12 +43,18 @@ pub enum ScannerError {
 
 pub struct Scanner {
     client: HttpClient,
-    interval: Duration,
+    interval: Interval,
+    from_block_number: U64,
     filter: Filter,
 }
 
 impl Scanner {
-    pub fn new(rpc_url: String, interval: Duration, filter: Filter) -> Result<Self, ScannerError> {
+    pub fn new(
+        rpc_url: String,
+        interval: Duration,
+        from_block_number: U64,
+        filter: Filter,
+    ) -> Result<Self, ScannerError> {
         Ok(Self {
             client: HttpClientBuilder::new()
                 .build(rpc_url.clone())
@@ -55,115 +62,62 @@ impl Scanner {
                     rpc_url,
                     source: err,
                 })?,
-            interval,
+            interval: tokio::time::interval(interval),
+            from_block_number,
             filter,
         })
     }
 
-    pub async fn stream(
-        self,
-    ) -> Result<
-        Pin<Box<impl futures::Stream<Item = Result<Vec<Update>, ScannerError>>>>,
-        ScannerError,
-    > {
-        let filter_id = self
-            .client
-            .request::<U256, Vec<Filter>>("eth_newFilter", vec![self.filter])
-            .await
-            .map_err(|err| ScannerError::NewFilter(err))?;
+    pub fn stream(mut self) -> Pin<Box<impl Stream<Item = Result<Vec<Update>, ScannerError>>>> {
+        let stream = try_stream! {
+            loop {
+                self.interval.tick().await;
 
-        let interval = self.interval.clone();
-        let stream = futures::stream::unfold(Vec::<Update>::new(), move |_| {
-            let mut interval = tokio::time::interval(interval);
-            let filter_id = filter_id.clone();
-            let client = self.client.clone();
-
-            async move {
-                interval.tick().await;
+                let filter = self.filter.clone().from_block(self.from_block_number).to_block(BlockNumber::Latest);
+                tracing::debug!("fetching new logs from block {:?} to {:?}", filter.get_from_block(), filter.get_to_block());
 
                 const ETH_GET_BLOCK_NUMBER_METHOD: &str = "eth_blockNumber";
-                const ETH_GET_FILTER_CHANGES_METHOD: &str = "eth_getFilterChanges";
+                const ETH_GET_LOGS_METHOD: &str = "eth_getLogs";
 
                 let mut batched_requests_builder = BatchRequestBuilder::new();
 
-                match batched_requests_builder
-                    .insert(ETH_GET_BLOCK_NUMBER_METHOD, Vec::<String>::new())
-                {
-                    Err(err) => {
-                        return Some((
-                            Err(ScannerError::AddCallToBatch {
-                                method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
-                                source: err,
-                            }),
-                            vec![],
-                        ))
-                    }
-                    Ok(_) => {}
-                }
+                batched_requests_builder
+                    .insert(ETH_GET_BLOCK_NUMBER_METHOD, Vec::<String>::new()).map_err(|err| ScannerError::AddCallToBatch {
+                        method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
+                        source: err,
+                    })?;
 
-                match batched_requests_builder
-                    .insert(ETH_GET_FILTER_CHANGES_METHOD, vec![filter_id])
-                {
-                    Err(err) => {
-                        return Some((
-                            Err(ScannerError::AddCallToBatch {
-                                method: ETH_GET_FILTER_CHANGES_METHOD.to_owned(),
-                                source: err,
-                            }),
-                            vec![],
-                        ))
-                    }
-                    Ok(_) => {}
-                };
+                batched_requests_builder
+                    .insert(ETH_GET_LOGS_METHOD, vec![filter]).map_err(|err| ScannerError::AddCallToBatch {
+                        method: ETH_GET_LOGS_METHOD.to_owned(),
+                        source: err,
+                    })?;
 
-                let responses = match client
+                let responses = self.client
                     .batch_request::<Value>(batched_requests_builder)
-                    .await
-                {
-                    Err(err) => return Some((Err(ScannerError::FilterUpdate(err)), vec![])),
-                    Ok(res) => res,
-                };
+                    .await.map_err(|err| ScannerError::FilterUpdate(err))?;
                 if responses.len() != 2 {
-                    return Some((Err(ScannerError::InconsistentResponses), vec![]));
+                    Err(ScannerError::InconsistentResponses)?;
                 }
 
                 let mut responses = responses.into_iter();
 
-                let next_response = match responses.next().unwrap() {
-                    Ok(res) => res,
-                    Err(err) => {
-                        return Some((
-                            Err(ScannerError::Response {
-                                method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
-                                source: err.into_owned(),
-                            }),
-                            vec![],
-                        ))
-                    }
-                };
+                let next_response = responses.next().unwrap().map_err(|err| ScannerError::Response {
+                    method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
+                    source: err.into_owned(),
+                })?;
 
-                let block_number = match serde_json::from_value::<U256>(next_response) {
-                    Err(err) => return Some((Err(ScannerError::Deserialize(err)), vec![])),
-                    Ok(res) => res,
-                };
+                let block_number = serde_json::from_value::<U64>(next_response).map_err(|err| ScannerError::Deserialize(err))?;
 
-                let next_response = match responses.next().unwrap() {
-                    Ok(res) => res,
-                    Err(err) => {
-                        return Some((
-                            Err(ScannerError::Response {
-                                method: ETH_GET_FILTER_CHANGES_METHOD.to_owned(),
-                                source: err.into_owned(),
-                            }),
-                            vec![],
-                        ))
-                    }
-                };
+                self.from_block_number = block_number;
+                tracing::debug!("from block number for next loop iteration updated to {}", self.from_block_number);
 
-                let logs = match serde_json::from_value::<Vec<Log>>(next_response) {
-                    Err(err) => return Some((Err(ScannerError::Deserialize(err)), vec![])),
-                    Ok(res) => res,
-                };
+                let next_response = responses.next().unwrap().map_err(|err| ScannerError::Response {
+                    method: ETH_GET_LOGS_METHOD.to_owned(),
+                    source: err.into_owned(),
+                })?;
+
+                let logs = serde_json::from_value::<Vec<Log>>(next_response).map_err(|err| ScannerError::Deserialize(err))?;
 
                 let mut updates = logs
                     .into_iter()
@@ -171,10 +125,10 @@ impl Scanner {
                     .collect::<Vec<Update>>();
                 updates.push(Update::NewBlock(block_number.as_u64()));
 
-                Some((Ok(updates), vec![]))
+                yield updates;
             }
-        });
+        };
 
-        Ok(Box::pin(stream))
+        Box::pin(stream)
     }
 }

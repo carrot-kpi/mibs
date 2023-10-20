@@ -3,10 +3,13 @@ mod scanner;
 pub mod types;
 mod utils;
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use chain_config::ChainConfig;
-use ethers::providers::{Middleware, ProviderError};
+use ethers::{
+    providers::{Middleware, ProviderError},
+    types::U64,
+};
 use futures::StreamExt;
 use governor::{Quota, RateLimiter};
 use thiserror::Error;
@@ -15,7 +18,7 @@ use tokio::{
     task::{JoinError, JoinSet},
 };
 use tracing_futures::Instrument;
-use types::{Config, Listener};
+use types::{Config, Listener, Provider};
 
 use crate::{scanner::Scanner, types::Update, utils::get_provider};
 
@@ -93,15 +96,30 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     ) -> Result<(), Error> {
         let chain_id = chain_config.id;
 
+        let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
+        let block_number = provider
+            .get_block_number()
+            .await
+            .map_err(|err| Error::BlockNumber {
+                chain_id,
+                source: err,
+            })?;
+
         let mut join_set = JoinSet::new();
 
-        let present_scanner = Self::scan_present(listener.clone(), chain_config.clone())
-            .instrument(tracing::info_span!("present-scanner", chain_id));
+        let present_scanner =
+            Self::scan_present(chain_config.clone(), block_number, listener.clone())
+                .instrument(tracing::info_span!("present-scanner", chain_id));
         join_set.spawn(present_scanner);
 
         if !chain_config.skip_past {
-            let past_scanner = Self::scan_past(listener.clone(), chain_config.clone())
-                .instrument(tracing::info_span!("past-scanner", chain_id));
+            let past_scanner = Self::scan_past(
+                chain_config.clone(),
+                provider,
+                block_number,
+                listener.clone(),
+            )
+            .instrument(tracing::info_span!("past-scanner", chain_id));
             join_set.spawn(past_scanner);
         }
 
@@ -126,19 +144,12 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     }
 
     async fn scan_past(
-        listener: Arc<Mutex<L>>,
         chain_config: Arc<ChainConfig>,
+        provider: Arc<Provider>,
+        block_number: U64,
+        listener: Arc<Mutex<L>>,
     ) -> Result<(), Error> {
-        let chain_id = chain_config.id;
-        let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
-        let block_number = provider
-            .get_block_number()
-            .await
-            .map_err(|err| Error::BlockNumber {
-                chain_id,
-                source: err,
-            })?
-            .as_u64();
+        let block_number = block_number.as_u64();
 
         let initial_block = chain_config.checkpoint_block;
         let mut from_block = initial_block;
@@ -243,30 +254,32 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     }
 
     async fn scan_present(
-        listener: Arc<Mutex<L>>,
         chain_config: Arc<ChainConfig>,
+        block_number: U64,
+        listener: Arc<Mutex<L>>,
     ) -> Result<(), Error> {
+        let mut backoff_duration = Duration::from_secs(1);
+
         loop {
             tracing::info!("watching present logs");
 
             let chain_id = chain_config.id;
             let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
-            let stream_future = match Scanner::new(
+            let mut stream = match Scanner::new(
                 chain_config.rpc_url.clone(),
                 chain_config.present_events_polling_interval,
+                block_number,
                 chain_config.events_filter.clone(),
             ) {
                 Ok(scanner) => scanner.stream(),
                 Err(error) => {
-                    tracing::error!("could not get onchain scanner: {:#}", error);
-                    continue;
-                }
-            };
-
-            let mut stream = match stream_future.await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::error!("could not get onchain scanner stream: {:#}", error);
+                    tracing::error!(
+                        "could not get onchain scanner, retrying after {}s backoff: {:#}",
+                        backoff_duration.as_secs(),
+                        error
+                    );
+                    tokio::time::sleep(backoff_duration).await;
+                    backoff_duration = backoff_duration * 2;
                     continue;
                 }
             };
