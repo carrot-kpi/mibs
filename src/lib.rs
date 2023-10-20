@@ -21,19 +21,20 @@ use crate::{scanner::Scanner, types::Update, utils::get_provider};
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("error joining past and present scanning tasks for chain {chain_id}")]
+    #[error("error joining past and present scanning tasks for chain {chain_id}: {source:#}")]
     PresentPastJoin { chain_id: u64, source: JoinError },
-    #[error("error joining chain scanning tasks")]
-    ChainsJoin(#[from] JoinError),
+    #[error("error joining chain scanning tasks: {0:#}")]
+    ChainsJoin(#[source] JoinError),
     #[error("chain id mismatch, provider gave {from_provider} while {expected} was expected")]
     ProviderChainIdMismatch { from_provider: u64, expected: u64 },
     #[error("could not get provider for chain {chain_id}")]
     ProviderConnection { chain_id: u64 },
     #[error("could not get chain id from provider for chain {chain_id}")]
     ProviderChainId { chain_id: u64 },
-    #[error("could not get current block number for chain {chain_id}")]
+    #[error("could not get current block number for chain {chain_id}: {source:#}")]
     BlockNumber {
         chain_id: u64,
+        #[source]
         source: ProviderError,
     },
 }
@@ -92,15 +93,17 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     ) -> Result<(), Error> {
         let chain_id = chain_config.id;
 
+        let mut join_set = JoinSet::new();
+
         let present_scanner = Self::scan_present(listener.clone(), chain_config.clone())
             .instrument(tracing::info_span!("present-scanner", chain_id));
-
-        let past_scanner = Self::scan_past(listener.clone(), chain_config.clone())
-            .instrument(tracing::info_span!("past-scanner", chain_id));
-
-        let mut join_set = JoinSet::new();
         join_set.spawn(present_scanner);
-        join_set.spawn(past_scanner);
+
+        if !chain_config.skip_past {
+            let past_scanner = Self::scan_past(listener.clone(), chain_config.clone())
+                .instrument(tracing::info_span!("past-scanner", chain_id));
+            join_set.spawn(past_scanner);
+        }
 
         // wait forever unless some task stops with an error
         while let Some(join_result) = join_set.join_next().await {
