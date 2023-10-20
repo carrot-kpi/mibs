@@ -1,26 +1,22 @@
 pub mod chain_config;
 mod scanner;
 pub mod types;
-mod utils;
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use chain_config::ChainConfig;
 use ethers::{
-    providers::{Middleware, ProviderError},
+    providers::{Http, Middleware, Provider, ProviderError},
     types::U64,
 };
 use futures::StreamExt;
 use governor::{Quota, RateLimiter};
 use thiserror::Error;
-use tokio::{
-    sync::Mutex,
-    task::{JoinError, JoinSet},
-};
+use tokio::task::{JoinError, JoinSet};
 use tracing_futures::Instrument;
-use types::{Config, Listener, Provider};
+use types::{Config, Listener};
 
-use crate::{scanner::Scanner, types::Update, utils::get_provider};
+use crate::{scanner::Scanner, types::Update};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -32,8 +28,12 @@ pub enum Error {
     ProviderChainIdMismatch { from_provider: u64, expected: u64 },
     #[error("could not get provider for chain {chain_id}")]
     ProviderConnection { chain_id: u64 },
-    #[error("could not get chain id from provider for chain {chain_id}")]
-    ProviderChainId { chain_id: u64 },
+    #[error("could not get remote chain id from provider for chain {chain_id}: {source:#}")]
+    ProviderChainId {
+        chain_id: u64,
+        #[source]
+        source: ProviderError,
+    },
     #[error("could not get current block number for chain {chain_id}: {source:#}")]
     BlockNumber {
         chain_id: u64,
@@ -43,34 +43,40 @@ pub enum Error {
 }
 
 pub struct Mibs<L: Listener + Send> {
-    config: Config,
-    listener: Arc<Mutex<L>>,
+    config: Config<L>,
 }
 
 impl<L: Listener + Send + Sync + 'static> Mibs<L> {
-    pub fn builder(listener: L) -> MibsBuilder<L>
+    pub fn builder() -> MibsBuilder<L>
     where
         L: Listener,
     {
-        MibsBuilder::new(listener)
+        MibsBuilder::new()
     }
 
     pub async fn scan(self) -> Result<(), Error> {
         let mut join_set = JoinSet::new();
         for chain_config in self.config.into_iter() {
-            let rpc_endpoint = chain_config.rpc_url.as_str();
+            let chain_id = chain_config.chain_id;
+            tracing::info!("setting up listener for chain with id {}", chain_id);
 
-            let chain_id = chain_config.id;
-            tracing::info!(
-                "setting up listener for chain with id {} with rpc endpoint: {}",
-                chain_id,
-                rpc_endpoint
-            );
+            let remote_chain_id = chain_config
+                .provider
+                .get_chainid()
+                .await
+                .map_err(|err| Error::ProviderChainId {
+                    chain_id,
+                    source: err,
+                })?
+                .as_u64();
+            if remote_chain_id != chain_id {
+                return Err(Error::ProviderChainIdMismatch {
+                    from_provider: remote_chain_id,
+                    expected: chain_id,
+                });
+            }
 
-            join_set.spawn(Self::scan_chain(
-                self.listener.clone(),
-                Arc::new(chain_config),
-            ));
+            join_set.spawn(Self::scan_chain(Arc::new(chain_config)));
         }
 
         // wait forever unless some task stops with an error
@@ -90,13 +96,10 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
         Ok(())
     }
 
-    async fn scan_chain(
-        listener: Arc<Mutex<L>>,
-        chain_config: Arc<ChainConfig>,
-    ) -> Result<(), Error> {
-        let chain_id = chain_config.id;
+    async fn scan_chain(chain_config: Arc<ChainConfig<L>>) -> Result<(), Error> {
+        let chain_id = chain_config.chain_id;
 
-        let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
+        let provider = chain_config.provider.clone();
         let block_number = provider
             .get_block_number()
             .await
@@ -107,19 +110,13 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
 
         let mut join_set = JoinSet::new();
 
-        let present_scanner =
-            Self::scan_present(chain_config.clone(), block_number, listener.clone())
-                .instrument(tracing::info_span!("present-scanner", chain_id));
+        let present_scanner = Self::scan_present(chain_config.clone(), block_number)
+            .instrument(tracing::info_span!("present-scanner", chain_id));
         join_set.spawn(present_scanner);
 
         if !chain_config.skip_past {
-            let past_scanner = Self::scan_past(
-                chain_config.clone(),
-                provider,
-                block_number,
-                listener.clone(),
-            )
-            .instrument(tracing::info_span!("past-scanner", chain_id));
+            let past_scanner = Self::scan_past(chain_config.clone(), provider, block_number)
+                .instrument(tracing::info_span!("past-scanner", chain_id));
             join_set.spawn(past_scanner);
         }
 
@@ -144,10 +141,9 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     }
 
     async fn scan_past(
-        chain_config: Arc<ChainConfig>,
-        provider: Arc<Provider>,
+        chain_config: Arc<ChainConfig<L>>,
+        provider: Arc<Provider<Http>>,
         block_number: U64,
-        listener: Arc<Mutex<L>>,
     ) -> Result<(), Error> {
         let block_number = block_number.as_u64();
 
@@ -158,18 +154,15 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
 
         if full_range == 0 {
             tracing::info!("no past blocks to scan, skipping");
-            listener
+            chain_config
+                .listener
                 .lock()
                 .await
-                .on_update(
-                    provider.clone(),
-                    &chain_config,
-                    Update::PastBatchCompleted {
-                        from_block,
-                        to_block: from_block,
-                        progress_percentage: 100f32,
-                    },
-                )
+                .on_update(Update::PastBatchCompleted {
+                    from_block,
+                    to_block: from_block,
+                    progress_percentage: 100f32,
+                })
                 .await;
             return Ok(());
         }
@@ -221,27 +214,25 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
             };
 
             for log in logs.into_iter() {
-                listener
+                chain_config
+                    .listener
                     .lock()
                     .await
-                    .on_update(provider.clone(), &chain_config, Update::NewLog(log))
+                    .on_update(Update::NewLog(log))
                     .await;
             }
 
-            listener
+            chain_config
+                .listener
                 .lock()
                 .await
-                .on_update(
-                    provider.clone(),
-                    &chain_config,
-                    Update::PastBatchCompleted {
-                        from_block,
-                        to_block,
-                        progress_percentage: ((to_block as f32 - initial_block as f32)
-                            / full_range as f32)
-                            * 100f32,
-                    },
-                )
+                .on_update(Update::PastBatchCompleted {
+                    from_block,
+                    to_block,
+                    progress_percentage: ((to_block as f32 - initial_block as f32)
+                        / full_range as f32)
+                        * 100f32,
+                })
                 .await;
 
             if to_block == block_number {
@@ -254,19 +245,16 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     }
 
     async fn scan_present(
-        chain_config: Arc<ChainConfig>,
+        chain_config: Arc<ChainConfig<L>>,
         block_number: U64,
-        listener: Arc<Mutex<L>>,
     ) -> Result<(), Error> {
         let mut backoff_duration = Duration::from_secs(1);
 
         loop {
             tracing::info!("watching present logs");
 
-            let chain_id = chain_config.id;
-            let provider = get_provider(chain_config.rpc_url.clone(), chain_id).await?;
             let mut stream = match Scanner::new(
-                chain_config.rpc_url.clone(),
+                chain_config.provider.clone(),
                 chain_config.present_events_polling_interval,
                 block_number,
                 chain_config.events_filter.clone(),
@@ -288,11 +276,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                 match updates_result {
                     Ok(logs) => {
                         for log in logs.into_iter() {
-                            listener
-                                .lock()
-                                .await
-                                .on_update(provider.clone(), &chain_config, log)
-                                .await;
+                            chain_config.listener.lock().await.on_update(log).await;
                         }
                     }
                     Err(err) => {
@@ -305,26 +289,21 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
 }
 
 pub struct MibsBuilder<L: Listener + Send + Sync + 'static> {
-    config: Config,
-    listener: L,
+    config: Config<L>,
 }
 
 impl<L: Listener + Send + Sync + 'static> MibsBuilder<L> {
-    pub fn new(listener: L) -> Self {
-        Self {
-            config: vec![],
-            listener,
-        }
+    pub fn new() -> Self {
+        Self { config: vec![] }
     }
 
     pub fn build(self) -> Mibs<L> {
         Mibs {
             config: self.config,
-            listener: Arc::new(Mutex::new(self.listener)),
         }
     }
 
-    pub fn chain_config(mut self, config: ChainConfig) -> Self {
+    pub fn chain_config(mut self, config: ChainConfig<L>) -> Self {
         self.config.push(config);
         self
     }
