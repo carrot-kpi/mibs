@@ -19,18 +19,18 @@ use crate::types::Update;
 
 #[derive(Error, Debug)]
 pub enum ScannerError {
-    #[error("could not connect to rpc url {rpc_url}: {source:#}")]
+    #[error("could not connect to rpc url {rpc_url}: {source:?}")]
     Connection {
         rpc_url: url::Url,
         source: jsonrpsee::core::Error,
     },
-    #[error("could not batch rpc call with method {method}: {source:#}")]
+    #[error("could not batch rpc call with method {method}: {source:?}")]
     AddCallToBatch {
         method: String,
         #[source]
         source: jsonrpsee::core::Error,
     },
-    #[error("could get new logs filter update: {0:#}")]
+    #[error("could get new logs filter update: {0:?}")]
     FilterUpdate(#[source] jsonrpsee::core::Error),
     #[error("inconsistent number of rpc responses")]
     InconsistentResponses,
@@ -40,7 +40,7 @@ pub enum ScannerError {
         #[source]
         source: ErrorObject<'static>,
     },
-    #[error("error deserializing response: {0:#}")]
+    #[error("error deserializing response: {0:?}")]
     Deserialize(#[source] serde_json::error::Error),
 }
 

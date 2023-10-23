@@ -20,21 +20,21 @@ use crate::{scanner::Scanner, types::Update};
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("error joining past and present scanning tasks for chain {chain_id}: {source:#}")]
+    #[error("error joining past and present scanning tasks for chain {chain_id}: {source:?}")]
     PresentPastJoin { chain_id: u64, source: JoinError },
-    #[error("error joining chain scanning tasks: {0:#}")]
+    #[error("error joining chain scanning tasks: {0:?}")]
     ChainsJoin(#[source] JoinError),
     #[error("chain id mismatch, provider gave {from_provider} while {expected} was expected")]
     ProviderChainIdMismatch { from_provider: u64, expected: u64 },
     #[error("could not get provider for chain {chain_id}")]
     ProviderConnection { chain_id: u64 },
-    #[error("could not get remote chain id from provider for chain {chain_id}: {source:#}")]
+    #[error("could not get remote chain id from provider for chain {chain_id}: {source:?}")]
     ProviderChainId {
         chain_id: u64,
         #[source]
         source: ProviderError,
     },
-    #[error("could not get current block number for chain {chain_id}: {source:#}")]
+    #[error("could not get current block number for chain {chain_id}: {source:?}")]
     BlockNumber {
         chain_id: u64,
         #[source]
@@ -147,7 +147,16 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     ) -> Result<(), Error> {
         let block_number = block_number.as_u64();
 
-        let initial_block = chain_config.checkpoint_block;
+        let initial_block = if block_number < chain_config.checkpoint_block {
+            tracing::warn!(
+                "had to adjust initial past scanning block from the given checkpoint {} to {}",
+                chain_config.checkpoint_block,
+                block_number
+            );
+            block_number
+        } else {
+            chain_config.checkpoint_block
+        };
         let mut from_block = initial_block;
         let full_range = block_number - initial_block;
         let chunk_size = chain_config.past_events_query_range;
@@ -168,7 +177,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
         }
 
         tracing::info!(
-            "pinning from {} past blocks, analyzing {} blocks at a time",
+            "analyzing {} past blocks {} at a time",
             block_number - from_block,
             chunk_size
         );
@@ -204,7 +213,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                 Ok(logs) => logs,
                 Err(error) => {
                     tracing::error!(
-                        "error fetching logs from block {} to {}: {:#}",
+                        "error fetching logs from block {} to {}: {:?}",
                         from_block,
                         to_block,
                         error
@@ -262,7 +271,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                 Ok(scanner) => scanner.stream(),
                 Err(error) => {
                     tracing::error!(
-                        "could not get onchain scanner, retrying after {}s backoff: {:#}",
+                        "could not get on-chain scanner, retrying after {}s backoff: {:?}",
                         backoff_duration.as_secs(),
                         error
                     );
@@ -280,7 +289,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                         }
                     }
                     Err(err) => {
-                        tracing::error!("error while scanning: {:#}", err);
+                        tracing::error!("error while scanning: {:?}", err);
                     }
                 }
             }
