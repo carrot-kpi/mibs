@@ -1,61 +1,83 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use ethers::types::Filter;
+use ethers::{
+    providers::{Http, Provider},
+    types::Filter,
+};
+use tokio::sync::Mutex;
+
+use crate::types::Listener;
 
 const DEFAULT_PAST_EVENTS_QUERY_RANGE: u64 = 5_000;
 const DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS: u64 = 60;
 
-pub struct ChainConfig {
-    pub id: u64,
-    pub rpc_url: String,
+pub struct ChainConfig<L: Listener> {
+    pub chain_id: u64,
+    pub provider: Arc<Provider<Http>>,
     pub checkpoint_block: u64,
     pub events_filter: Filter,
     pub skip_past: bool,
     pub past_events_query_range: u64,
     pub past_events_query_max_rps: Option<u32>,
     pub present_events_polling_interval: Duration,
+    pub listener: Arc<Mutex<L>>,
 }
 
-impl ChainConfig {
+impl<L: Listener> ChainConfig<L> {
     pub fn builder(
-        id: u64,
-        rpc_url: String,
+        chain_id: u64,
+        provider: Arc<Provider<Http>>,
         checkpoint_block: u64,
         events_filter: Filter,
-    ) -> ChainConfigBuilder {
-        ChainConfigBuilder::new(id, rpc_url, checkpoint_block, events_filter)
+        listener: L,
+    ) -> ChainConfigBuilder<L> {
+        ChainConfigBuilder::new(
+            chain_id,
+            provider,
+            checkpoint_block,
+            events_filter,
+            listener,
+        )
     }
 }
 
-pub struct ChainConfigBuilder {
-    id: u64,
-    rpc_url: String,
+pub struct ChainConfigBuilder<L: Listener> {
+    chain_id: u64,
+    provider: Arc<Provider<Http>>,
     checkpoint_block: u64,
     events_filter: Filter,
     skip_past: Option<bool>,
     past_events_query_range: Option<u64>,
     past_events_query_max_rps: Option<u32>,
     present_events_polling_interval: Option<Duration>,
+    listener: L,
 }
 
-impl ChainConfigBuilder {
-    pub fn new(id: u64, rpc_url: String, checkpoint_block: u64, events_filter: Filter) -> Self {
+impl<L: Listener> ChainConfigBuilder<L> {
+    pub fn new(
+        chain_id: u64,
+        provider: Arc<Provider<Http>>,
+        checkpoint_block: u64,
+        events_filter: Filter,
+        listener: L,
+    ) -> Self {
         Self {
-            id,
-            rpc_url,
+            chain_id,
+            provider,
             checkpoint_block,
             events_filter,
             skip_past: None,
             past_events_query_range: None,
             past_events_query_max_rps: None,
             present_events_polling_interval: None,
+            listener,
         }
     }
 
-    pub fn build(self) -> ChainConfig {
+    pub fn build(self) -> ChainConfig<L> {
         ChainConfig {
-            id: self.id,
-            rpc_url: self.rpc_url,
+            chain_id: self.chain_id,
+            provider: self.provider,
             checkpoint_block: self.checkpoint_block,
             events_filter: self.events_filter,
             skip_past: self.skip_past.unwrap_or(false),
@@ -66,6 +88,7 @@ impl ChainConfigBuilder {
             present_events_polling_interval: self.present_events_polling_interval.unwrap_or(
                 Duration::from_secs(DEFAULT_PRESENT_EVENTS_POLLING_INTERVAL_SECONDS),
             ),
+            listener: Arc::new(Mutex::new(self.listener)),
         }
     }
 

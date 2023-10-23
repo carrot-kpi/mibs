@@ -1,7 +1,10 @@
-use std::{fmt::Debug, pin::Pin, time::Duration};
+use std::{fmt::Debug, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::try_stream;
-use ethers::types::{BlockNumber, Filter, Log, U64};
+use ethers::{
+    providers::{Http, Provider},
+    types::{BlockNumber, Filter, Log, U64},
+};
 use futures::Stream;
 use jsonrpsee::{
     core::{client::ClientT, params::BatchRequestBuilder},
@@ -18,7 +21,7 @@ use crate::types::Update;
 pub enum ScannerError {
     #[error("could not connect to rpc url {rpc_url}: {source:#}")]
     Connection {
-        rpc_url: String,
+        rpc_url: url::Url,
         source: jsonrpsee::core::Error,
     },
     #[error("could not batch rpc call with method {method}: {source:#}")]
@@ -50,18 +53,20 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(
-        rpc_url: String,
+        provider: Arc<Provider<Http>>,
         interval: Duration,
         from_block_number: U64,
         filter: Filter,
     ) -> Result<Self, ScannerError> {
+        let rpc_url = provider.url();
+
         Ok(Self {
-            client: HttpClientBuilder::new()
-                .build(rpc_url.clone())
-                .map_err(|err| ScannerError::Connection {
-                    rpc_url,
+            client: HttpClientBuilder::new().build(rpc_url).map_err(|err| {
+                ScannerError::Connection {
+                    rpc_url: rpc_url.clone(),
                     source: err,
-                })?,
+                }
+            })?,
             interval: tokio::time::interval(interval),
             from_block_number,
             filter,

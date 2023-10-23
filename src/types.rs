@@ -1,10 +1,5 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use ethers::{
-    providers::{Http, Provider as EthersProvider},
-    types::Log,
-};
+use ethers::types::Log;
 
 use crate::chain_config::ChainConfig;
 
@@ -18,11 +13,9 @@ pub enum Update {
     },
 }
 
-pub type Config = Vec<ChainConfig>;
-
-pub type Provider = EthersProvider<Http>;
+pub type Config<L> = Vec<ChainConfig<L>>;
 
 #[async_trait]
 pub trait Listener {
-    async fn on_update(&mut self, provider: Arc<Provider>, chain_config: &ChainConfig, update: Update);
+    async fn on_update(&mut self, update: Update);
 }
