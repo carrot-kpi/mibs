@@ -6,11 +6,8 @@ use crate::chain_config::ChainConfig;
 pub enum Update {
     NewBlock(u64),
     NewLog(Log),
-    PastBatchCompleted {
-        from_block: u64,
-        to_block: u64,
-        progress_percentage: f32,
-    },
+    PastBatchCompleted { from_block: u64, to_block: u64 },
+    PastScanningCompleted,
 }
 
 pub type Config<L> = Vec<ChainConfig<L>>;

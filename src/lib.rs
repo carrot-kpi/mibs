@@ -147,7 +147,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     ) -> Result<(), Error> {
         let block_number = block_number.as_u64();
 
-        let initial_block = if block_number < chain_config.checkpoint_block {
+        let mut from_block = if block_number < chain_config.checkpoint_block {
             tracing::warn!(
                 "had to adjust initial past scanning block from the given checkpoint {} to {}",
                 chain_config.checkpoint_block,
@@ -157,21 +157,23 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
         } else {
             chain_config.checkpoint_block
         };
-        let mut from_block = initial_block;
-        let full_range = block_number - initial_block;
+        let full_range = block_number - from_block;
         let chunk_size = chain_config.past_events_query_range;
 
         if full_range == 0 {
             tracing::info!("no past blocks to scan, skipping");
-            chain_config
-                .listener
-                .lock()
-                .await
+
+            let mut locked_listener = chain_config.listener.lock().await;
+
+            locked_listener
                 .on_update(Update::PastBatchCompleted {
                     from_block,
                     to_block: from_block,
-                    progress_percentage: 100f32,
                 })
+                .await;
+
+            locked_listener
+                .on_update(Update::PastScanningCompleted)
                 .await;
             return Ok(());
         }
@@ -238,9 +240,6 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                 .on_update(Update::PastBatchCompleted {
                     from_block,
                     to_block,
-                    progress_percentage: ((to_block as f32 - initial_block as f32)
-                        / full_range as f32)
-                        * 100f32,
                 })
                 .await;
 
