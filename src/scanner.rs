@@ -1,6 +1,7 @@
 use std::{fmt::Debug, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::try_stream;
+use backoff::ExponentialBackoffBuilder;
 use ethers::{
     providers::{Http, Provider},
     types::{BlockNumber, Filter, Log, U64},
@@ -16,6 +17,9 @@ use thiserror::Error;
 use tokio::time::Interval;
 
 use crate::types::Update;
+
+const ETH_GET_BLOCK_NUMBER_METHOD: &str = "eth_blockNumber";
+const ETH_GET_LOGS_METHOD: &str = "eth_getLogs";
 
 #[derive(Error, Debug)]
 pub enum ScannerError {
@@ -78,29 +82,48 @@ impl Scanner {
             loop {
                 self.interval.tick().await;
 
-                let filter = self.filter.clone().from_block(self.from_block_number).to_block(BlockNumber::Latest);
-                tracing::debug!("fetching new logs from block {:?} to {:?}", filter.get_from_block(), filter.get_to_block());
+                let perform = || async {
+                    let filter = self.filter.clone().from_block(self.from_block_number).to_block(BlockNumber::Latest);
+                    tracing::debug!("fetching new logs from block {:?} to {:?}", filter.get_from_block(), filter.get_to_block());
 
-                const ETH_GET_BLOCK_NUMBER_METHOD: &str = "eth_blockNumber";
-                const ETH_GET_LOGS_METHOD: &str = "eth_getLogs";
+                    let mut batched_requests_builder = BatchRequestBuilder::new();
 
-                let mut batched_requests_builder = BatchRequestBuilder::new();
+                    batched_requests_builder
+                        .insert(ETH_GET_BLOCK_NUMBER_METHOD, Vec::<String>::new()).map_err(|err| backoff::Error::Transient {
+                            err: ScannerError::AddCallToBatch {
+                                method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
+                                source: err,
+                            },
+                            retry_after: None,
+                        })?;
 
-                batched_requests_builder
-                    .insert(ETH_GET_BLOCK_NUMBER_METHOD, Vec::<String>::new()).map_err(|err| ScannerError::AddCallToBatch {
-                        method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
-                        source: err,
-                    })?;
+                    batched_requests_builder
+                        .insert(ETH_GET_LOGS_METHOD, vec![filter]).map_err(|err| backoff::Error::Transient {
+                            err: ScannerError::AddCallToBatch {
+                                method: ETH_GET_LOGS_METHOD.to_owned(),
+                                source: err,
+                            },
+                            retry_after: None,
+                        })?;
 
-                batched_requests_builder
-                    .insert(ETH_GET_LOGS_METHOD, vec![filter]).map_err(|err| ScannerError::AddCallToBatch {
-                        method: ETH_GET_LOGS_METHOD.to_owned(),
-                        source: err,
-                    })?;
-
-                let responses = self.client
+                    self.client
                     .batch_request::<Value>(batched_requests_builder)
-                    .await.map_err(|err| ScannerError::FilterUpdate(err))?;
+                    .await.map_err(|err| {backoff::Error::Transient {
+                        err: ScannerError::FilterUpdate(err),
+                        retry_after: None,
+                    }})
+                };
+
+                let responses = backoff::future::retry(
+                    ExponentialBackoffBuilder::new()
+                        .with_max_elapsed_time(Some(
+                            self.interval.period() / 2,
+                        ))
+                        .build(),
+                        perform,
+                )
+                .await?;
+
                 if responses.len() != 2 {
                     Err(ScannerError::InconsistentResponses)?;
                 }
