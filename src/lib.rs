@@ -267,6 +267,13 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
             from_block = to_block + 1;
         }
 
+        chain_config
+            .listener
+            .lock()
+            .await
+            .on_update(Update::PastScanningCompleted)
+            .await;
+
         Ok(())
     }
 
