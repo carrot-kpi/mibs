@@ -4,6 +4,7 @@ pub mod types;
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
+use backoff::ExponentialBackoffBuilder;
 use chain_config::ChainConfig;
 use ethers::{
     providers::{Http, Middleware, Provider, ProviderError},
@@ -211,7 +212,24 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                 rate_limiter.until_ready().await;
             }
 
-            let logs = match provider.get_logs(&filter).await {
+            let fetch_logs = || async {
+                provider
+                    .get_logs(&filter)
+                    .await
+                    .map_err(|err| backoff::Error::Transient {
+                        err,
+                        retry_after: None,
+                    })
+            };
+
+            let logs = match backoff::future::retry(
+                ExponentialBackoffBuilder::new()
+                    .with_max_elapsed_time(Some(Duration::from_secs(30)))
+                    .build(),
+                fetch_logs,
+            )
+            .await
+            {
                 Ok(logs) => logs,
                 Err(error) => {
                     tracing::error!(
