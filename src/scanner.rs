@@ -1,4 +1,4 @@
-use std::{fmt::Debug, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Debug, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::try_stream;
 use backoff::ExponentialBackoffBuilder;
@@ -46,12 +46,14 @@ pub enum ScannerError {
     },
     #[error("error deserializing response: {0:?}")]
     Deserialize(#[source] serde_json::error::Error),
+    #[error("error creating log key: no {0}")]
+    LogKeyCreation(String),
 }
-
 pub struct Scanner {
     client: HttpClient,
     interval: Interval,
     from_block_number: U64,
+    previous_logs: HashMap<Vec<u8>, Log>,
     filter: Filter,
 }
 
@@ -71,6 +73,7 @@ impl Scanner {
                     source: err,
                 }
             })?,
+            previous_logs: HashMap::new(),
             interval: tokio::time::interval(interval),
             from_block_number,
             filter,
@@ -137,7 +140,7 @@ impl Scanner {
 
                 let block_number = serde_json::from_value::<U64>(next_response).map_err(|err| ScannerError::Deserialize(err))?;
 
-                self.from_block_number = block_number;
+                self.from_block_number = block_number + 1;
                 tracing::debug!("from block number for next loop iteration updated to {}", self.from_block_number);
 
                 let next_response = responses.next().unwrap().map_err(|err| ScannerError::Response {
@@ -146,11 +149,17 @@ impl Scanner {
                 })?;
 
                 let logs = serde_json::from_value::<Vec<Log>>(next_response).map_err(|err| ScannerError::Deserialize(err))?;
+                let mut updates = vec![];
+                let mut new_previous_logs = HashMap::new();
+                for log in logs.into_iter() {
+                    let log_hash = log_hash(&log)?;
+                    if !self.previous_logs.contains_key(&log_hash) {
+                        updates.push(Update::NewLog(log.clone()));
+                        new_previous_logs.insert(log_hash, log);
+                    }
+                }
+                self.previous_logs = new_previous_logs;
 
-                let mut updates = logs
-                    .into_iter()
-                    .map(|log| Update::NewLog(log))
-                    .collect::<Vec<Update>>();
                 updates.push(Update::NewBlock(block_number.as_u64()));
 
                 yield updates;
@@ -158,5 +167,57 @@ impl Scanner {
         };
 
         Box::pin(stream)
+    }
+}
+
+fn log_hash(log: &Log) -> Result<Vec<u8>, ScannerError> {
+    let address = log.address;
+
+    let block_hash = if let Some(block_hash) = log.block_hash {
+        block_hash
+    } else {
+        return Err(ScannerError::LogKeyCreation("blockHash".to_owned()));
+    };
+
+    let log_index = if let Some(log_index) = log.log_index {
+        log_index
+    } else {
+        return Err(ScannerError::LogKeyCreation("logIndex".to_owned()));
+    };
+
+    let mut out = vec![];
+    out.extend_from_slice(address.as_bytes());
+    out.extend_from_slice(block_hash.as_bytes());
+
+    let mut log_index_bytes: [u8; 32] = [0; 32];
+    log_index.to_big_endian(&mut log_index_bytes);
+    out.extend_from_slice(log_index_bytes.as_slice());
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod test {
+    use ethers::types::{Log, H256};
+
+    use super::log_hash;
+
+    #[test]
+    fn log_hash_block_hash_none() {
+        let log = Log {
+            ..Default::default()
+        };
+        let error = log_hash(&log).unwrap_err();
+        assert_eq!(error.to_string(), "error creating log key: no blockHash",);
+    }
+
+    #[test]
+    fn log_hash_log_index_none() {
+        let log = Log {
+            block_hash: Some(H256::random()),
+            ..Default::default()
+        };
+        let error = log_hash(&log).unwrap_err();
+        assert_eq!(error.to_string(), "error creating log key: no logIndex",);
     }
 }
