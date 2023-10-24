@@ -60,6 +60,7 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(
         provider: Arc<Provider<Http>>,
+        timeout: Duration,
         interval: Duration,
         from_block_number: U64,
         filter: Filter,
@@ -67,12 +68,13 @@ impl Scanner {
         let rpc_url = provider.url();
 
         Ok(Self {
-            client: HttpClientBuilder::new().build(rpc_url).map_err(|err| {
-                ScannerError::Connection {
+            client: HttpClientBuilder::new()
+                .request_timeout(timeout)
+                .build(rpc_url)
+                .map_err(|err| ScannerError::Connection {
                     rpc_url: rpc_url.clone(),
                     source: err,
-                }
-            })?,
+                })?,
             previous_logs: HashMap::new(),
             interval: tokio::time::interval(interval),
             from_block_number,

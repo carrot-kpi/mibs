@@ -281,6 +281,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
 
             let mut stream = match Scanner::new(
                 chain_config.provider.clone(),
+                chain_config.rpc_requests_timeout,
                 chain_config.present_events_polling_interval,
                 block_number,
                 chain_config.events_filter.clone(),
