@@ -9,12 +9,13 @@ use ethers::{
 use futures::Stream;
 use jsonrpsee::{
     core::{client::ClientT, params::BatchRequestBuilder},
-    http_client::{HttpClient, HttpClientBuilder},
+    http_client::HttpClientBuilder,
     types::ErrorObject,
 };
 use serde_json::Value;
 use thiserror::Error;
 use tokio::time::Interval;
+use url::Url;
 
 use crate::types::Update;
 
@@ -50,7 +51,8 @@ pub enum ScannerError {
     LogKeyCreation(String),
 }
 pub struct Scanner {
-    client: HttpClient,
+    rpc_url: Url,
+    timeout: Duration,
     interval: Interval,
     from_block_number: U64,
     previous_logs: HashMap<Vec<u8>, Log>,
@@ -65,16 +67,9 @@ impl Scanner {
         from_block_number: U64,
         filter: Filter,
     ) -> Result<Self, ScannerError> {
-        let rpc_url = provider.url();
-
         Ok(Self {
-            client: HttpClientBuilder::new()
-                .request_timeout(timeout)
-                .build(rpc_url)
-                .map_err(|err| ScannerError::Connection {
-                    rpc_url: rpc_url.clone(),
-                    source: err,
-                })?,
+            rpc_url: provider.url().clone(),
+            timeout,
             previous_logs: HashMap::new(),
             interval: tokio::time::interval(interval),
             from_block_number,
@@ -86,6 +81,14 @@ impl Scanner {
         let stream = try_stream! {
             loop {
                 self.interval.tick().await;
+
+                let client = HttpClientBuilder::new()
+                    .request_timeout(self.timeout)
+                    .build(&self.rpc_url)
+                    .map_err(|err| ScannerError::Connection {
+                        rpc_url: self.rpc_url.clone(),
+                        source: err,
+                    })?;
 
                 let perform = || async {
                     let filter = self.filter.clone().from_block(self.from_block_number).to_block(BlockNumber::Latest);
@@ -113,12 +116,12 @@ impl Scanner {
 
                     tracing::debug!("sending request {:?}", batched_requests_builder);
 
-                    self.client
-                    .batch_request::<Value>(batched_requests_builder)
-                    .await.map_err(|err| {backoff::Error::Transient {
-                        err: ScannerError::FilterUpdate(err),
-                        retry_after: None,
-                    }})
+                    client
+                        .batch_request::<Value>(batched_requests_builder)
+                        .await.map_err(|err| {backoff::Error::Transient {
+                            err: ScannerError::FilterUpdate(err),
+                            retry_after: None,
+                        }})
                 };
 
                 let responses = backoff::future::retry(
