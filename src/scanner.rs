@@ -111,6 +111,8 @@ impl Scanner {
                             retry_after: None,
                         })?;
 
+                    tracing::debug!("sending request {:?}", batched_requests_builder);
+
                     self.client
                     .batch_request::<Value>(batched_requests_builder)
                     .await.map_err(|err| {backoff::Error::Transient {
