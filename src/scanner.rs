@@ -25,7 +25,7 @@ pub enum ScannerError {
 pub struct Scanner {
     provider: Arc<Provider<Http>>,
     interval: Interval,
-    from_block_number: U64,
+    from_block_number: u64,
     previous_logs: HashMap<Vec<u8>, Log>,
     filter: Filter,
 }
@@ -41,7 +41,7 @@ impl Scanner {
             provider: provider.clone(),
             previous_logs: HashMap::new(),
             interval: tokio::time::interval(interval),
-            from_block_number,
+            from_block_number: from_block_number.as_u64(),
             filter,
         })
     }
@@ -76,6 +76,8 @@ impl Scanner {
                         perform,
                 )
                 .await?;
+
+                self.from_block_number = block_number;
 
                 let mut updates = vec![];
                 let mut new_previous_logs = HashMap::new();
