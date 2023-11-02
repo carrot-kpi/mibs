@@ -3,56 +3,27 @@ use std::{collections::HashMap, fmt::Debug, pin::Pin, sync::Arc, time::Duration}
 use async_stream::try_stream;
 use backoff::ExponentialBackoffBuilder;
 use ethers::{
-    providers::{Http, Provider},
-    types::{BlockNumber, Filter, Log, U64},
+    middleware::Middleware,
+    providers::{Http, Provider, ProviderError},
+    types::{Filter, Log, U64},
 };
 use futures::Stream;
-use jsonrpsee::{
-    core::{client::ClientT, params::BatchRequestBuilder},
-    http_client::HttpClientBuilder,
-    types::ErrorObject,
-};
-use serde_json::Value;
 use thiserror::Error;
 use tokio::time::Interval;
-use url::Url;
 
 use crate::types::Update;
 
-const ETH_GET_BLOCK_NUMBER_METHOD: &str = "eth_blockNumber";
-const ETH_GET_LOGS_METHOD: &str = "eth_getLogs";
-
 #[derive(Error, Debug)]
 pub enum ScannerError {
-    #[error("could not connect to rpc url {rpc_url}: {source:?}")]
-    Connection {
-        rpc_url: url::Url,
-        source: jsonrpsee::core::Error,
-    },
-    #[error("could not batch rpc call with method {method}: {source:?}")]
-    AddCallToBatch {
-        method: String,
-        #[source]
-        source: jsonrpsee::core::Error,
-    },
-    #[error("could get new logs filter update: {0:?}")]
-    FilterUpdate(#[source] jsonrpsee::core::Error),
-    #[error("inconsistent number of rpc responses")]
-    InconsistentResponses,
-    #[error("{method} call failed: ({}: {})", .source.code(), .source.message())]
-    Response {
-        method: String,
-        #[source]
-        source: ErrorObject<'static>,
-    },
-    #[error("error deserializing response: {0:?}")]
-    Deserialize(#[source] serde_json::error::Error),
+    #[error("could not get block number: {0}:?")]
+    GetBlockNumber(#[source] ProviderError),
+    #[error("could not get logs: {0:?}")]
+    GetLogs(#[source] ProviderError),
     #[error("error creating log key: no {0}")]
     LogKeyCreation(String),
 }
 pub struct Scanner {
-    rpc_url: Url,
-    timeout: Duration,
+    provider: Arc<Provider<Http>>,
     interval: Interval,
     from_block_number: U64,
     previous_logs: HashMap<Vec<u8>, Log>,
@@ -62,14 +33,12 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(
         provider: Arc<Provider<Http>>,
-        timeout: Duration,
         interval: Duration,
         from_block_number: U64,
         filter: Filter,
     ) -> Result<Self, ScannerError> {
         Ok(Self {
-            rpc_url: provider.url().clone(),
-            timeout,
+            provider: provider.clone(),
             previous_logs: HashMap::new(),
             interval: tokio::time::interval(interval),
             from_block_number,
@@ -82,49 +51,23 @@ impl Scanner {
             loop {
                 self.interval.tick().await;
 
-                let client = HttpClientBuilder::new()
-                    .request_timeout(self.timeout)
-                    .build(&self.rpc_url)
-                    .map_err(|err| ScannerError::Connection {
-                        rpc_url: self.rpc_url.clone(),
-                        source: err,
-                    })?;
-
                 let perform = || async {
-                    let filter = self.filter.clone().from_block(self.from_block_number).to_block(BlockNumber::Latest);
+                    let block_number = self.provider.get_block_number().await.map_err(|err| {
+                        backoff::Error::Transient {
+                            err: ScannerError::GetBlockNumber(err),
+                            retry_after: None
+                        }
+                    })?;
+                    let filter = self.filter.clone().from_block(self.from_block_number).to_block(block_number);
                     tracing::debug!("fetching new logs from block {:?} to {:?}", filter.get_from_block(), filter.get_to_block());
-
-                    let mut batched_requests_builder = BatchRequestBuilder::new();
-
-                    batched_requests_builder
-                        .insert(ETH_GET_BLOCK_NUMBER_METHOD, Vec::<String>::new()).map_err(|err| backoff::Error::Transient {
-                            err: ScannerError::AddCallToBatch {
-                                method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
-                                source: err,
-                            },
-                            retry_after: None,
-                        })?;
-
-                    batched_requests_builder
-                        .insert(ETH_GET_LOGS_METHOD, vec![filter]).map_err(|err| backoff::Error::Transient {
-                            err: ScannerError::AddCallToBatch {
-                                method: ETH_GET_LOGS_METHOD.to_owned(),
-                                source: err,
-                            },
-                            retry_after: None,
-                        })?;
-
-                    tracing::debug!("sending request {:?}", batched_requests_builder);
-
-                    client
-                        .batch_request::<Value>(batched_requests_builder)
-                        .await.map_err(|err| {backoff::Error::Transient {
-                            err: ScannerError::FilterUpdate(err),
-                            retry_after: None,
-                        }})
+                    let logs = self.provider.get_logs(&filter).await.map_err(|err| backoff::Error::Transient {
+                        err: ScannerError::GetLogs(err),
+                        retry_after: None,
+                    })?;
+                    Ok::<(u64, Vec<ethers::types::Log>), backoff::Error<ScannerError>>((block_number.as_u64(), logs))
                 };
 
-                let responses = backoff::future::retry(
+                let (block_number, logs) = backoff::future::retry(
                     ExponentialBackoffBuilder::new()
                         .with_max_elapsed_time(Some(
                             self.interval.period() / 2,
@@ -134,28 +77,6 @@ impl Scanner {
                 )
                 .await?;
 
-                if responses.len() != 2 {
-                    Err(ScannerError::InconsistentResponses)?;
-                }
-
-                let mut responses = responses.into_iter();
-
-                let next_response = responses.next().unwrap().map_err(|err| ScannerError::Response {
-                    method: ETH_GET_BLOCK_NUMBER_METHOD.to_owned(),
-                    source: err.into_owned(),
-                })?;
-
-                let block_number = serde_json::from_value::<U64>(next_response).map_err(|err| ScannerError::Deserialize(err))?;
-
-                self.from_block_number = block_number + 1;
-                tracing::debug!("from block number for next loop iteration updated to {}", self.from_block_number);
-
-                let next_response = responses.next().unwrap().map_err(|err| ScannerError::Response {
-                    method: ETH_GET_LOGS_METHOD.to_owned(),
-                    source: err.into_owned(),
-                })?;
-
-                let logs = serde_json::from_value::<Vec<Log>>(next_response).map_err(|err| ScannerError::Deserialize(err))?;
                 let mut updates = vec![];
                 let mut new_previous_logs = HashMap::new();
                 for log in logs.into_iter() {
@@ -167,7 +88,7 @@ impl Scanner {
                 }
                 self.previous_logs = new_previous_logs;
 
-                updates.push(Update::NewBlock(block_number.as_u64()));
+                updates.push(Update::NewBlock(block_number));
 
                 yield updates;
             }
