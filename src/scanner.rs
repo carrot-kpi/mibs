@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fmt::Debug, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::try_stream;
-use backoff::ExponentialBackoffBuilder;
 use ethers::{
     middleware::Middleware,
     providers::{Http, Provider, ProviderError},
@@ -12,6 +11,10 @@ use thiserror::Error;
 use tokio::time::Interval;
 
 use crate::types::Update;
+
+const STARTING_BACKOFF_DELAY: Duration = Duration::from_secs(1);
+const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(8);
+const BACKOFF_FACTOR: u32 = 2;
 
 #[derive(Error, Debug)]
 pub enum ScannerError {
@@ -27,7 +30,7 @@ pub struct Scanner {
     interval: Interval,
     from_block_number: u64,
     previous_logs: HashMap<Vec<u8>, Log>,
-    filter: Filter,
+    base_filter: Filter,
 }
 
 impl Scanner {
@@ -35,14 +38,14 @@ impl Scanner {
         provider: Arc<Provider<Http>>,
         interval: Duration,
         from_block_number: U64,
-        filter: Filter,
+        base_filter: Filter,
     ) -> Result<Self, ScannerError> {
         Ok(Self {
             provider: provider.clone(),
             previous_logs: HashMap::new(),
             interval: tokio::time::interval(interval),
             from_block_number: from_block_number.as_u64(),
-            filter,
+            base_filter,
         })
     }
 
@@ -51,33 +54,27 @@ impl Scanner {
             loop {
                 self.interval.tick().await;
 
-                let perform = || async {
-                    let block_number = self.provider.get_block_number().await.map_err(|err| {
-                        backoff::Error::Transient {
-                            err: ScannerError::GetBlockNumber(err),
-                            retry_after: None
+                let mut total_interval = Duration::from_secs(0);
+                let mut retry_period = STARTING_BACKOFF_DELAY;
+                let (block_number, logs) = loop {
+                    match self.fetch_current_block_number_and_logs_update().await {
+                        Ok(result) => break result,
+                        Err(err) => {
+                            total_interval += retry_period;
+                            if total_interval >= MAX_BACKOFF_DELAY {
+                                Err(err)?;
+                            }
+
+                            tokio::time::sleep(retry_period).await;
+
+                            retry_period = if total_interval + retry_period * BACKOFF_FACTOR > MAX_BACKOFF_DELAY {
+                                MAX_BACKOFF_DELAY - total_interval
+                            } else {
+                                retry_period * BACKOFF_FACTOR
+                            };
                         }
-                    })?;
-                    let filter = self.filter.clone().from_block(self.from_block_number).to_block(block_number);
-                    tracing::debug!("fetching new logs from block {:?} to {:?}", filter.get_from_block(), filter.get_to_block());
-                    let logs = self.provider.get_logs(&filter).await.map_err(|err| backoff::Error::Transient {
-                        err: ScannerError::GetLogs(err),
-                        retry_after: None,
-                    })?;
-                    Ok::<(u64, Vec<ethers::types::Log>), backoff::Error<ScannerError>>((block_number.as_u64(), logs))
+                    }
                 };
-
-                let (block_number, logs) = backoff::future::retry(
-                    ExponentialBackoffBuilder::new()
-                        .with_max_elapsed_time(Some(
-                            self.interval.period() / 2,
-                        ))
-                        .build(),
-                        perform,
-                )
-                .await?;
-
-                self.from_block_number = block_number;
 
                 let mut updates = vec![];
                 let mut new_previous_logs = HashMap::new();
@@ -97,6 +94,46 @@ impl Scanner {
         };
 
         Box::pin(stream)
+    }
+
+    async fn fetch_current_block_number_and_logs_update(
+        &mut self,
+    ) -> Result<(u64, Vec<Log>), ScannerError> {
+        let block_number = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(|err| ScannerError::GetBlockNumber(err))?
+            .as_u64();
+        tracing::debug!("latest block number: {:?}", block_number);
+
+        let from_block_number = self.from_block_number;
+        tracing::debug!(
+            "updating filter from block number to {:?} and to block number to {:?}",
+            from_block_number,
+            block_number
+        );
+        let filter = self
+            .base_filter
+            .clone()
+            .from_block(from_block_number)
+            .to_block(block_number);
+
+        tracing::debug!(
+            "fetching new logs from block {:?} to {:?}",
+            filter.get_from_block(),
+            filter.get_to_block()
+        );
+        let logs = self
+            .provider
+            .get_logs(&filter)
+            .await
+            .map_err(|err| ScannerError::GetLogs(err))?;
+
+        tracing::debug!("updating from block number to {:?}", block_number);
+        self.from_block_number = block_number;
+
+        Ok((block_number, logs))
     }
 }
 
