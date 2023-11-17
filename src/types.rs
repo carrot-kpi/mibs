@@ -3,6 +3,7 @@ use ethers::types::Log;
 
 use crate::chain_config::ChainConfig;
 
+#[derive(Debug)]
 pub enum Update {
     NewBlock(u64),
     NewLog(Log),
