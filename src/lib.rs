@@ -6,10 +6,7 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use backoff::ExponentialBackoffBuilder;
 use chain_config::ChainConfig;
-use ethers::{
-    providers::{Http, Middleware, Provider, ProviderError},
-    types::U64,
-};
+use ethers::providers::{Http, Middleware, Provider, ProviderError};
 use futures::StreamExt;
 use governor::{Quota, RateLimiter};
 use thiserror::Error;
@@ -107,7 +104,8 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
             .map_err(|err| Error::BlockNumber {
                 chain_id,
                 source: err,
-            })?;
+            })?
+            .as_u64();
 
         let mut join_set = JoinSet::new();
 
@@ -144,21 +142,27 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
     async fn scan_past(
         chain_config: Arc<ChainConfig<L>>,
         provider: Arc<Provider<Http>>,
-        block_number: U64,
+        current_block_number: u64,
     ) -> Result<(), Error> {
-        let block_number = block_number.as_u64();
+        tracing::debug!("current block number: {current_block_number}");
 
-        let mut from_block = if block_number < chain_config.checkpoint_block {
+        let mut from_block = if current_block_number < chain_config.checkpoint_block {
             tracing::warn!(
                 "had to adjust initial past scanning block from the given checkpoint {} to {}",
                 chain_config.checkpoint_block,
-                block_number
+                current_block_number
             );
-            block_number
+            current_block_number
         } else {
             chain_config.checkpoint_block
         };
-        let full_range = block_number - from_block;
+        tracing::debug!("chain checkpoint block number: {from_block}");
+
+        let full_range = current_block_number - from_block;
+        tracing::debug!(
+            "full range calculated from current block number and checkpoint block: {full_range}"
+        );
+
         let chunk_size = chain_config.past_events_query_range;
 
         if full_range == 0 {
@@ -166,22 +170,29 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
 
             let mut locked_listener = chain_config.listener.lock().await;
 
-            locked_listener
-                .on_update(Update::PastBatchCompleted {
-                    from_block,
-                    to_block: from_block,
-                })
-                .await;
+            let update = Update::PastBatchCompleted {
+                from_block,
+                to_block: from_block,
+            };
+            tracing::debug!(
+                "sending past batch completed update event to listener: {:?}",
+                update
+            );
+            locked_listener.on_update(update).await;
+            tracing::debug!("past batch completed update event successfully sent to listener");
 
+            tracing::debug!("sending past scanning completed update event to listener");
             locked_listener
                 .on_update(Update::PastScanningCompleted)
                 .await;
+            tracing::debug!("past scanning completed update event successfully sent to listener");
+
             return Ok(());
         }
 
         tracing::info!(
             "analyzing {} past blocks {} at a time",
-            block_number - from_block,
+            current_block_number - from_block,
             chunk_size
         );
 
@@ -195,8 +206,8 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
             };
 
         loop {
-            let to_block = if from_block + chunk_size > block_number {
-                block_number
+            let to_block = if from_block + chunk_size > current_block_number {
+                current_block_number
             } else {
                 from_block + chunk_size
             };
@@ -243,45 +254,55 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
             };
 
             for log in logs.into_iter() {
-                chain_config
-                    .listener
-                    .lock()
-                    .await
-                    .on_update(Update::NewLog(log))
-                    .await;
+                let update = Update::NewLog(log);
+                tracing::debug!("sending new log update event to listener: {:?}", update);
+                chain_config.listener.lock().await.on_update(update).await;
+                tracing::debug!("new log update event successfully sent to listener");
             }
 
-            chain_config
-                .listener
-                .lock()
-                .await
-                .on_update(Update::PastBatchCompleted {
-                    from_block,
-                    to_block,
-                })
-                .await;
+            let update = Update::PastBatchCompleted {
+                from_block,
+                to_block,
+            };
+            tracing::debug!(
+                "sending past batch completed event to listener: {:?}",
+                update
+            );
+            chain_config.listener.lock().await.on_update(update).await;
+            tracing::debug!("past batch completed event successfully sent to listener");
 
-            if to_block == block_number {
+            if to_block == current_block_number {
                 break;
             }
             from_block = to_block + 1;
         }
 
+        tracing::debug!("sending past scanning completed update event to listener");
         chain_config
             .listener
             .lock()
             .await
             .on_update(Update::PastScanningCompleted)
             .await;
+        tracing::debug!("past scanning completed update event successfully sent to listener");
 
         Ok(())
     }
 
     async fn scan_present(
         chain_config: Arc<ChainConfig<L>>,
-        block_number: U64,
+        block_number: u64,
     ) -> Result<(), Error> {
         let mut backoff_duration = Duration::from_secs(1);
+
+        // this is used in case an error happens and the loop is once again invoked after
+        // the stream is "broken". If that happens let's say 8 hours into the indexer operations,
+        // the from_block_number passed to the scanner constructor will be too outdated and trigger
+        // a range too wide error. we solve this by keeping an updated from block number in memory
+        // and updating it at each stream update so that if anything happens the scanner will be
+        // reinstantiated with a reasonably up to date from block number (unless something catastrophic
+        // happens)
+        let mut from_block_number = block_number;
 
         loop {
             tracing::info!("watching present logs");
@@ -289,7 +310,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
             let mut stream = match Scanner::new(
                 chain_config.provider.clone(),
                 chain_config.present_events_polling_interval,
-                block_number,
+                from_block_number,
                 chain_config.events_filter.clone(),
             ) {
                 Ok(scanner) => scanner.stream(),
@@ -307,10 +328,14 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
 
             while let Some(updates_result) = stream.next().await {
                 match updates_result {
-                    Ok(logs) => {
-                        for log in logs.into_iter() {
-                            chain_config.listener.lock().await.on_update(log).await;
+                    Ok((updates, latest_block_number)) => {
+                        let mut locked_listener = chain_config.listener.lock().await;
+                        for update in updates.into_iter() {
+                            tracing::debug!("sending update to listener: {update:?}");
+                            locked_listener.on_update(update).await;
+                            tracing::debug!("update sent to listener");
                         }
+                        from_block_number = latest_block_number;
                     }
                     Err(err) => {
                         tracing::error!("error while scanning: {:?}", err);

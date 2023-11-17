@@ -4,7 +4,7 @@ use async_stream::try_stream;
 use ethers::{
     middleware::Middleware,
     providers::{Http, Provider, ProviderError},
-    types::{Filter, Log, U64},
+    types::{Filter, Log},
 };
 use futures::Stream;
 use thiserror::Error;
@@ -37,19 +37,21 @@ impl Scanner {
     pub fn new(
         provider: Arc<Provider<Http>>,
         interval: Duration,
-        from_block_number: U64,
+        from_block_number: u64,
         base_filter: Filter,
     ) -> Result<Self, ScannerError> {
         Ok(Self {
             provider: provider.clone(),
             previous_logs: HashMap::new(),
             interval: tokio::time::interval(interval),
-            from_block_number: from_block_number.as_u64(),
+            from_block_number: from_block_number,
             base_filter,
         })
     }
 
-    pub fn stream(mut self) -> Pin<Box<impl Stream<Item = Result<Vec<Update>, ScannerError>>>> {
+    pub fn stream(
+        mut self,
+    ) -> Pin<Box<impl Stream<Item = Result<(Vec<Update>, u64), ScannerError>>>> {
         let stream = try_stream! {
             loop {
                 self.interval.tick().await;
@@ -63,7 +65,10 @@ impl Scanner {
                             total_interval += retry_period;
                             if total_interval >= MAX_BACKOFF_DELAY {
                                 Err(err)?;
+                            } else {
+                                tracing::info!("error while fetching the current block number and log updates, retrying after {}s: {:?}", retry_period.as_secs(), err);
                             }
+
 
                             tokio::time::sleep(retry_period).await;
 
@@ -89,7 +94,7 @@ impl Scanner {
 
                 updates.push(Update::NewBlock(block_number));
 
-                yield updates;
+                yield (updates, block_number);
             }
         };
 
