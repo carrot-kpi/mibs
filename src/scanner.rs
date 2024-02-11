@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fmt::Debug, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::try_stream;
+use backoff::ExponentialBackoffBuilder;
 use ethers::{
     middleware::Middleware,
     providers::{Http, Provider, ProviderError},
@@ -8,18 +9,20 @@ use ethers::{
 };
 use futures::Stream;
 use thiserror::Error;
-use tokio::time::Interval;
+use tokio::{sync::Mutex, time::Interval};
 
 use crate::types::Update;
 
 const STARTING_BACKOFF_DELAY: Duration = Duration::from_secs(1);
 const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(8);
-const BACKOFF_FACTOR: u32 = 2;
+const BACKOFF_FACTOR: f64 = 2.0;
 
 #[derive(Error, Debug)]
 pub enum ScannerError {
     #[error("could not get block number: {0}:?")]
     GetBlockNumber(#[source] ProviderError),
+    #[error("inconsistent block number fetched: {0} is less than {1}")]
+    InconsistentBlockNumber(u64, u64),
     #[error("could not get logs: {0:?}")]
     GetLogs(#[source] ProviderError),
     #[error("error creating log key: no {0}")]
@@ -56,28 +59,31 @@ impl Scanner {
             loop {
                 self.interval.tick().await;
 
-                let mut total_interval = Duration::from_secs(0);
-                let mut retry_period = STARTING_BACKOFF_DELAY;
-                let (block_number, logs) = loop {
-                    match self.fetch_current_block_number_and_logs_update().await {
-                        Ok(result) => break result,
-                        Err(err) => {
-                            total_interval += retry_period;
-                            if total_interval >= MAX_BACKOFF_DELAY {
-                                Err(err)?;
-                            } else {
-                                tracing::info!("error while fetching the current block number and log updates, retrying after {}s: {:?}", retry_period.as_secs(), err);
-                            }
+                let backoff = ExponentialBackoffBuilder::new()
+                    .with_initial_interval(STARTING_BACKOFF_DELAY)
+                    .with_max_elapsed_time(Some(MAX_BACKOFF_DELAY))
+                    .with_multiplier(BACKOFF_FACTOR)
+                    .build();
 
-
-                            tokio::time::sleep(retry_period).await;
-
-                            retry_period = if total_interval + retry_period * BACKOFF_FACTOR > MAX_BACKOFF_DELAY {
-                                MAX_BACKOFF_DELAY - total_interval
-                            } else {
-                                retry_period * BACKOFF_FACTOR
-                            };
+                let this = Arc::new(Mutex::new(&mut self));
+                let fetch = || async {
+                    this.lock().await.fetch_current_block_number_and_logs_update().await.map_err(|err| {
+                        tracing::warn!("error while fetching the current block number and log updates, retrying: {:?}", err);
+                        backoff::Error::Transient {
+                            err,
+                            retry_after: None,
                         }
+                    })
+                };
+
+                let (block_number, logs) = match backoff::future::retry(backoff, fetch).await {
+                    Ok(logs) => logs,
+                    Err(error) => {
+                        tracing::error!(
+                            "error fetching current block number and logs update: {:?}",
+                            error
+                        );
+                        continue;
                     }
                 };
 
@@ -113,6 +119,13 @@ impl Scanner {
         tracing::debug!("latest block number: {:?}", block_number);
 
         let from_block_number = self.from_block_number;
+        if block_number < from_block_number {
+            Err(ScannerError::InconsistentBlockNumber(
+                block_number,
+                from_block_number,
+            ))?
+        }
+
         tracing::debug!(
             "updating filter from block number to {:?} and to block number to {:?}",
             from_block_number,

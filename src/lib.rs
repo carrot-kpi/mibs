@@ -319,8 +319,8 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                 }
                 Err(error) => {
                     tracing::error!(
-                        "could not get on-chain scanner, retrying after {}s backoff: {:?}",
-                        backoff_duration.as_secs(),
+                        "could not get on-chain scanner, retrying after {:?} backoff: {:?}",
+                        backoff_duration,
                         error
                     );
                     tokio::time::sleep(backoff_duration).await;
@@ -345,7 +345,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                         tokio::time::sleep(backoff_duration).await;
                         backoff_duration = backoff_duration * 2;
                         tracing::error!(
-                            "error while scanning, retrying after {:?}s backoff: {:?}",
+                            "error while scanning, retrying after {:?} backoff: {:?}",
                             backoff_duration,
                             err
                         );
