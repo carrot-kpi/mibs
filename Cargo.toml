@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 async-stream = "0.3.5"
 async-trait = "0.1.74"
 backoff = { version = "0.4.0", features = ["tokio"] }
-ethers = { version = "2.0.7", features = ["rustls"] }
+ethers = { version = "2.0.13", features = ["rustls"] }
 futures = "0.3.28"
 governor = "0.5.1"
 serde_json = { version = "1.0.107", features = ["raw_value"] }

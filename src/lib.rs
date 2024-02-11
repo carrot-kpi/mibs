@@ -313,7 +313,10 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                 from_block_number,
                 chain_config.events_filter.clone(),
             ) {
-                Ok(scanner) => scanner.stream(),
+                Ok(scanner) => {
+                    backoff_duration = Duration::from_secs(1);
+                    scanner.stream()
+                }
                 Err(error) => {
                     tracing::error!(
                         "could not get on-chain scanner, retrying after {}s backoff: {:?}",
@@ -329,6 +332,7 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
             while let Some(updates_result) = stream.next().await {
                 match updates_result {
                     Ok((updates, latest_block_number)) => {
+                        backoff_duration = Duration::from_secs(1);
                         let mut locked_listener = chain_config.listener.lock().await;
                         for update in updates.into_iter() {
                             tracing::debug!("sending update to listener: {update:?}");
@@ -338,7 +342,13 @@ impl<L: Listener + Send + Sync + 'static> Mibs<L> {
                         from_block_number = latest_block_number;
                     }
                     Err(err) => {
-                        tracing::error!("error while scanning: {:?}", err);
+                        tokio::time::sleep(backoff_duration).await;
+                        backoff_duration = backoff_duration * 2;
+                        tracing::error!(
+                            "error while scanning, retrying after {:?}s backoff: {:?}",
+                            backoff_duration,
+                            err
+                        );
                     }
                 }
             }
